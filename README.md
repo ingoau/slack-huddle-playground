@@ -30,10 +30,13 @@ only if you tick "Remember". The server only answers requests whose `Host` and
 - **Huddle**: join or start the huddle in a channel or DM (`rooms.join`), or
   accept an invite that arrives over the realtime socket (`huddle_invite`).
   The page joins the Amazon Chime meeting itself, muted and sending silence;
-  you can unmute or switch to your microphone, and you hear the huddle.
+  you can unmute or switch to your microphone, and you hear the huddle. Join
+  as many huddles as you like at once, or the same huddle several times
+  (× count); each is its own Chime connection with its own controls.
 - **Participants**: Chime attendee presence, with Slack names, mute state,
   volume, and a button that sends a `muteRequest`.
-- **Send**:
+- **Send**: to any mix of joined huddles, ticked at the top of the card.
+  In raw PeerMessage JSON, `"SELF"` becomes each huddle's own attendee ID.
   - Reaction: emoji with any type and `emojiUrl`, repeatable to try Slack's
     "explosion".
   - Effect: effect reacji such as `gong`.

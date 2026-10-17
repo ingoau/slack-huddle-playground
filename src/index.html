@@ -13,7 +13,7 @@
       <div class="pills">
         <span class="pill" id="slack-pill">Slack: offline</span>
         <span class="pill" id="rtm-pill">Realtime: offline</span>
-        <span class="pill" id="call-pill">Huddle: not joined</span>
+        <span class="pill" id="call-pill">Huddles: none</span>
       </div>
     </header>
 
@@ -76,6 +76,18 @@
               <option>ap-southeast-2</option>
               <option>ap-northeast-1</option>
             </select>
+            <label
+              class="inline"
+              title="Join this many times, each as a separate connection"
+              >×
+              <input
+                name="count"
+                type="number"
+                min="1"
+                max="20"
+                value="1"
+                class="narrow"
+            /></label>
             <button type="submit" class="primary">Join / start</button>
           </form>
           <h3>Invites</h3>
@@ -84,20 +96,18 @@
               Invites to huddles arrive here over the realtime socket.
             </li>
           </ul>
-          <div id="call" hidden>
-            <h3>Current call</h3>
+          <div id="calls-section" hidden>
+            <h3>Joined</h3>
+            <ul class="list" id="calls"></ul>
             <dl class="facts" id="call-facts"></dl>
-            <div class="row wrap">
-              <button id="mic-toggle">Unmute</button>
-              <button id="mic-source">Use microphone</button>
-              <button id="speaker-toggle">Mute speaker</button>
-              <button id="leave" class="danger">Leave</button>
-            </div>
           </div>
         </article>
 
         <article class="card">
-          <h2>Participants</h2>
+          <div class="card-head">
+            <h2>Participants</h2>
+            <span class="hint" id="roster-call"></span>
+          </div>
           <ul class="list" id="roster">
             <li class="empty">Join a huddle to see who is in it.</li>
           </ul>
@@ -106,7 +116,10 @@
 
       <section class="column">
         <article class="card">
-          <h2>Send</h2>
+          <div class="card-head">
+            <h2>Send</h2>
+          </div>
+          <div class="row wrap targets" id="send-targets"></div>
           <nav class="tabs" id="send-tabs">
             <button data-tab="reaction" class="active">Reaction</button>
             <button data-tab="effect">Effect</button>
@@ -203,7 +216,10 @@
             <form id="sticky-form" class="stack">
               <input name="emoji" placeholder="speaker" />
               <div class="row">
-                <input name="channel" placeholder="Awareness channel" />
+                <input
+                  name="channel"
+                  placeholder="Awareness channel (default: each huddle's)"
+                />
                 <input name="user" placeholder="User ID" />
               </div>
               <div class="row">
@@ -213,8 +229,8 @@
             </form>
             <p class="hint">
               Sticky emoji travel as an <code>awarenessBroadcast</code> with
-              field <code>stickyEmoji</code>. The channel is prefilled with the
-              huddle's channel, which is a guess; edit it if Slack ignores it.
+              field <code>stickyEmoji</code>. Left empty, the channel is each
+              huddle's own, which is a guess; fill it in if Slack ignores it.
             </p>
           </div>
 
@@ -316,7 +332,6 @@
       </section>
     </main>
 
-    <audio id="huddle-audio" autoplay></audio>
     <div class="toast" id="toast" hidden></div>
     <script type="module" src="/client.js"></script>
   </body>

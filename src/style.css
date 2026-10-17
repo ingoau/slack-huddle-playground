@@ -493,3 +493,37 @@ code {
   background: var(--danger);
   color: #fff;
 }
+
+.list li.call {
+  cursor: pointer;
+}
+
+.list li.call.selected {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.log .tag {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 5px;
+  font-family: var(--mono);
+}
+
+.targets {
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.targets:empty {
+  display: none;
+}
+
+.targets label.inline {
+  color: var(--text);
+}
+
+#call-facts:not(:empty) {
+  margin-top: 10px;
+}

@@ -169,19 +169,46 @@ function printable(bytes: Uint8Array) {
 
 // ---------------------------------------------------------------- state
 
+/** One joined huddle, with its own Chime session and audio. */
+type Call = {
+  /** Local ID; the same huddle can be joined more than once. */
+  id: string;
+  join: ChimeJoin;
+  session: DefaultMeetingSession;
+  selfAttendeeId: string;
+  status: string;
+  attendees: Map<string, Attendee>;
+  micMuted: boolean;
+  usingMic: boolean;
+  speakerMuted: boolean;
+  audio: HTMLAudioElement;
+  /** The channel's name once Slack tells us. */
+  channelName: string;
+  /** Which connection to this huddle this is, from 1. */
+  copy: number;
+};
+
+function callLabel(call: Call) {
+  return call.copy > 1
+    ? `${call.channelName} (${call.copy})`
+    : call.channelName;
+}
+
 let server: ServerState = { connected: false, realtimeStatus: "offline" };
-let call: ChimeJoin | undefined;
-let session: DefaultMeetingSession | undefined;
-let selfAttendeeId = "";
 let micStream: MediaStream | undefined;
-let silentContext: AudioContext | undefined;
-let micMuted = true;
-let speakerMuted = false;
-let callStatus = "not joined";
-const attendees = new Map<string, Attendee>();
+let audioContext: AudioContext | undefined;
+const calls = new Map<string, Call>();
+let selectedCallId: string | undefined;
+let nextCallId = 1;
+// Huddles the Send card is aimed at; new joins are added.
+const sendTargets = new Set<string>();
 const topics = new Set([dataChannelTopic, transcriptCatchUpTopic]);
 const userNames = new Map<string, Promise<string | undefined>>();
 const invites = new Map<string, Record<string, unknown>>();
+
+function selectedCall() {
+  return selectedCallId ? calls.get(selectedCallId) : undefined;
+}
 
 // ---------------------------------------------------------------- header
 
@@ -201,10 +228,18 @@ function renderPills() {
         ? "pill warn"
         : "pill";
 
-  const huddle = $("#call-pill");
-  huddle.textContent = `Huddle: ${callStatus}`;
-  huddle.className =
-    callStatus === "connected" ? "pill ok" : call ? "pill warn" : "pill";
+  const huddles = $("#call-pill");
+  const connected = [...calls.values()].filter(
+    (call) => call.status === "connected",
+  ).length;
+  huddles.textContent = calls.size
+    ? `Huddles: ${connected}/${calls.size} connected`
+    : "Huddles: none";
+  huddles.className = !calls.size
+    ? "pill"
+    : connected === calls.size
+      ? "pill ok"
+      : "pill warn";
 }
 
 function renderIdentity() {
@@ -260,7 +295,7 @@ connectForm.addEventListener("submit", async (event) => {
 });
 
 $("#disconnect").addEventListener("click", async () => {
-  await leave().catch(() => {});
+  await Promise.all([...calls.values()].map((call) => leave(call)));
   server = await post<ServerState>("/api/disconnect");
   renderPills();
   renderIdentity();
@@ -287,9 +322,13 @@ function userName(userId: string) {
   return name;
 }
 
-function describeAttendee(attendeeId: string, externalUserId?: string) {
-  if (attendeeId === selfAttendeeId) return "you";
-  const known = attendees.get(attendeeId);
+function describeAttendee(
+  call: Call,
+  attendeeId: string,
+  externalUserId?: string,
+) {
+  if (attendeeId === call.selfAttendeeId) return "you";
+  const known = call.attendees.get(attendeeId);
   return slackUserId(externalUserId ?? known?.externalUserId) ?? attendeeId;
 }
 
@@ -299,189 +338,273 @@ const joinForm = $<HTMLFormElement>("#join-form");
 joinForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const data = new FormData(joinForm);
-  await joinWith(() =>
-    post<ChimeJoin>("/api/join", {
-      channelId: String(data.get("channelId")).trim(),
-      region: String(data.get("region")),
-    }),
-  );
+  const count = Math.max(1, Math.min(20, Number(data.get("count")) || 1));
+  // One at a time, so each rooms.join sees the previous connection.
+  for (let i = 0; i < count; i++)
+    await joinWith(() =>
+      post<ChimeJoin>("/api/join", {
+        channelId: String(data.get("channelId")).trim(),
+        region: String(data.get("region")),
+      }),
+    );
 });
 
+let joining = 0;
 async function joinWith(request: () => Promise<ChimeJoin>) {
-  if (call) await leave();
-  callStatus = "joining";
-  renderPills();
+  joining++;
+  renderCalls();
   try {
     await startChime(await request());
   } catch (error) {
-    callStatus = "not joined";
-    call = undefined;
-    renderPills();
     toast(`Could not join: ${errorMessage(error)}`, true);
+  } finally {
+    joining--;
+    renderCalls();
   }
 }
 
 function silentStream() {
-  silentContext ??= new AudioContext();
-  return silentContext.createMediaStreamDestination().stream;
+  audioContext ??= new AudioContext();
+  return audioContext.createMediaStreamDestination().stream;
 }
 
 async function startChime(join: ChimeJoin) {
-  call = join;
   const logger = new ConsoleLogger("Playground", LogLevel.WARN);
   const configuration = new MeetingSessionConfiguration(
     join.meeting,
     join.attendee,
   );
-  selfAttendeeId = configuration.credentials?.attendeeId ?? "";
-  const meeting = new DefaultMeetingSession(
+  const session = new DefaultMeetingSession(
     configuration,
     logger,
     new DefaultDeviceController(logger),
   );
-  session = meeting;
-  const audioVideo = meeting.audioVideo;
+  const audio = el("audio", { autoplay: true });
+  document.body.append(audio);
+  const siblings = [...calls.values()].filter(
+    (other) => other.join.callId === join.callId,
+  );
+  const call: Call = {
+    id: String(nextCallId++),
+    join,
+    session,
+    selfAttendeeId: configuration.credentials?.attendeeId ?? "",
+    status: "connecting",
+    attendees: new Map(),
+    micMuted: true,
+    usingMic: false,
+    speakerMuted: false,
+    audio,
+    channelName: siblings[0]?.channelName ?? join.channelId,
+    copy: Math.max(0, ...siblings.map((other) => other.copy)) + 1,
+  };
+  // Chime allows one connection per attendee, so a repeat attendee would
+  // knock the earlier connection out.
+  if (siblings.some((other) => other.selfAttendeeId === call.selfAttendeeId))
+    toast(
+      "Slack reused an attendee ID, so the earlier connection will likely drop",
+      true,
+    );
+  calls.set(call.id, call);
+  selectedCallId = call.id;
+  sendTargets.add(call.id);
+  void post<{ channel?: { name?: string } }>("/api/slack", {
+    method: "conversations.info",
+    fields: { channel: join.channelId },
+  })
+    .then((result) => {
+      if (result.channel?.name) call.channelName = `#${result.channel.name}`;
+      renderCalls();
+    })
+    .catch(() => {});
 
+  const audioVideo = session.audioVideo;
   audioVideo.addObserver({
     audioVideoDidStart: () => {
-      callStatus = "connected";
-      renderPills();
-      toast("Joined the huddle");
+      call.status = "connected";
+      renderCalls();
+      toast(`Joined ${callLabel(call)}`);
     },
     audioVideoDidStartConnecting: (reconnecting) => {
-      callStatus = reconnecting ? "reconnecting" : "connecting";
-      renderPills();
+      call.status = reconnecting ? "reconnecting" : "connecting";
+      renderCalls();
     },
     audioVideoDidStop: (status: MeetingSessionStatus) => {
-      if (session !== meeting) return;
-      callStatus = `ended (${status.statusCode()})`;
-      renderPills();
+      call.status = `ended (${status.statusCode()})`;
+      renderCalls();
     },
   });
 
   audioVideo.realtimeSubscribeToAttendeeIdPresence(
     (attendeeId, present, externalUserId) =>
-      updatePresence(attendeeId, present, externalUserId),
+      updatePresence(call, attendeeId, present, externalUserId),
   );
-  for (const topic of topics) subscribeTopic(topic);
+  for (const topic of topics) subscribeTopic(call, topic);
 
-  await audioVideo.bindAudioElement($<HTMLAudioElement>("#huddle-audio"));
-  await audioVideo.startAudioInput(micStream ?? silentStream());
+  await audioVideo.bindAudioElement(audio);
+  await audioVideo.startAudioInput(silentStream());
   audioVideo.start();
   audioVideo.realtimeMuteLocalAudio();
-  micMuted = true;
 
-  renderCall();
-  renderRoster();
-  prefillSticky();
-  renderRawTemplates();
+  renderCalls();
 }
 
-function subscribeTopic(topic: string) {
-  session?.audioVideo.realtimeSubscribeToReceiveDataMessage(
+function subscribeTopic(call: Call, topic: string) {
+  call.session.audioVideo.realtimeSubscribeToReceiveDataMessage(
     topic,
-    (message: DataMessage) => logDataMessage("in", message),
+    (message: DataMessage) => logDataMessage(call, "in", message),
   );
 }
 
-async function leave() {
-  if (!call) return;
-  const ended = call;
-  const meeting = session;
-  call = undefined;
-  session = undefined;
-  if (meeting) {
-    meeting.audioVideo.stop();
-    await meeting.audioVideo.stopAudioInput().catch(() => {});
-    meeting.audioVideo.unbindAudioElement();
-  }
-  attendees.clear();
-  callStatus = "not joined";
-  renderPills();
-  renderCall();
-  renderRoster();
-  await post("/api/leave", {
-    channelId: ended.channelId,
-    callId: ended.callId,
-    attendeeId: selfAttendeeId,
-  }).catch((error) => toast(`rooms.leave: ${errorMessage(error)}`, true));
+async function leave(call: Call) {
+  if (calls.get(call.id) !== call) return;
+  calls.delete(call.id);
+  sendTargets.delete(call.id);
+  if (selectedCallId === call.id) selectedCallId = calls.keys().next().value;
+  call.session.audioVideo.stop();
+  await call.session.audioVideo.stopAudioInput().catch(() => {});
+  call.session.audioVideo.unbindAudioElement();
+  call.audio.remove();
+  releaseMicIfUnused();
+  renderCalls();
+  await post("/api/leave", leaveBody(call)).catch((error) =>
+    toast(`rooms.leave: ${errorMessage(error)}`, true),
+  );
 }
 
-$("#leave").addEventListener("click", () => void leave());
+function leaveBody(call: Call) {
+  return {
+    channelId: call.join.channelId,
+    callId: call.join.callId,
+    attendeeId: call.selfAttendeeId,
+  };
+}
 
 // Tell Slack we left when the tab closes, as Slack's own client does.
 addEventListener("pagehide", () => {
-  if (!call) return;
-  void fetch("/api/leave", {
-    method: "POST",
-    keepalive: true,
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      channelId: call.channelId,
-      callId: call.callId,
-      attendeeId: selfAttendeeId,
-    }),
-  });
+  for (const call of calls.values())
+    void fetch("/api/leave", {
+      method: "POST",
+      keepalive: true,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(leaveBody(call)),
+    });
 });
 
-$("#mic-toggle").addEventListener("click", () => {
-  if (!session) return;
-  if (micMuted) session.audioVideo.realtimeUnmuteLocalAudio();
-  else session.audioVideo.realtimeMuteLocalAudio();
-  micMuted = !micMuted;
-  renderCall();
-});
+function toggleMute(call: Call) {
+  if (call.micMuted) call.session.audioVideo.realtimeUnmuteLocalAudio();
+  else call.session.audioVideo.realtimeMuteLocalAudio();
+  call.micMuted = !call.micMuted;
+  renderCalls();
+}
 
-$("#mic-source").addEventListener("click", async () => {
+// Every huddle using the microphone shares one capture.
+async function toggleMicSource(call: Call) {
   try {
-    if (micStream) {
-      for (const track of micStream.getTracks()) track.stop();
-      micStream = undefined;
-    } else {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    }
-    await session?.audioVideo.startAudioInput(micStream ?? silentStream());
-    renderCall();
+    if (!call.usingMic)
+      micStream ??= await navigator.mediaDevices.getUserMedia({ audio: true });
+    call.usingMic = !call.usingMic;
+    await call.session.audioVideo.startAudioInput(
+      call.usingMic ? micStream! : silentStream(),
+    );
+    releaseMicIfUnused();
+    renderCalls();
   } catch (error) {
     toast(`Microphone: ${errorMessage(error)}`, true);
   }
-});
+}
 
-$("#speaker-toggle").addEventListener("click", () => {
-  speakerMuted = !speakerMuted;
-  $<HTMLAudioElement>("#huddle-audio").muted = speakerMuted;
-  renderCall();
-});
+function releaseMicIfUnused() {
+  if (!micStream || [...calls.values()].some((call) => call.usingMic)) return;
+  for (const track of micStream.getTracks()) track.stop();
+  micStream = undefined;
+}
 
-function renderCall() {
-  const section = $("#call");
-  section.hidden = !call;
-  if (!call) return;
-  const facts: [string, string][] = [
-    ["Channel", call.channelId],
-    ["Call", call.callId],
-    ["Attendee", selfAttendeeId],
-    [
-      "Meeting",
-      String(
-        (call.meeting.Meeting as Record<string, unknown> | undefined)
-          ?.MeetingId ??
-          call.meeting.MeetingId ??
-          "",
+function toggleSpeaker(call: Call) {
+  call.speakerMuted = !call.speakerMuted;
+  call.audio.muted = call.speakerMuted;
+  renderCalls();
+}
+
+function selectCall(callId: string) {
+  selectedCallId = callId;
+  renderCalls();
+}
+
+function renderCalls() {
+  renderPills();
+  $("#calls-section").hidden = !calls.size && !joining;
+  const rows = [...calls.values()].map((call) => {
+    const button = (
+      label: string,
+      onClick: () => void,
+      className = "small",
+    ) => {
+      const node = el("button", { className }, label);
+      node.onclick = (event) => {
+        event.stopPropagation();
+        onClick();
+      };
+      return node;
+    };
+    const present = [...call.attendees.values()].filter((a) => a.present);
+    const row = el(
+      "li",
+      {
+        className: call.id === selectedCallId ? "call selected" : "call",
+      },
+      el(
+        "span",
+        { className: "grow" },
+        callLabel(call),
+        el(
+          "span",
+          { className: "sub" },
+          `${call.status} · ${present.length} here · ${call.selfAttendeeId}`,
+        ),
       ),
-    ],
-  ];
+      button(call.micMuted ? "Unmute" : "Mute", () => toggleMute(call)),
+      button(
+        call.usingMic ? "Silence" : "Mic",
+        () => void toggleMicSource(call),
+      ),
+      button(call.speakerMuted ? "🔇" : "🔊", () => toggleSpeaker(call)),
+      button("Leave", () => void leave(call), "small danger"),
+    );
+    row.title = "Select to see participants and details";
+    row.onclick = () => selectCall(call.id);
+    return row;
+  });
+  if (joining) rows.push(el("li", { className: "empty" }, "Joining…"));
+  $("#calls").replaceChildren(...rows);
+
+  const call = selectedCall();
+  const facts: [string, string][] = call
+    ? [
+        ["Channel", call.join.channelId],
+        ["Call", call.join.callId],
+        ["Attendee", call.selfAttendeeId],
+        [
+          "Meeting",
+          String(
+            (call.join.meeting.Meeting as Record<string, unknown> | undefined)
+              ?.MeetingId ??
+              call.join.meeting.MeetingId ??
+              "",
+          ),
+        ],
+      ]
+    : [];
   $("#call-facts").replaceChildren(
     ...facts.flatMap(([term, value]) => [
       el("dt", {}, term),
       el("dd", {}, value),
     ]),
   );
-  $("#mic-toggle").textContent = micMuted ? "Unmute" : "Mute";
-  $("#mic-source").textContent = micStream ? "Use silence" : "Use microphone";
-  $("#speaker-toggle").textContent = speakerMuted
-    ? "Unmute speaker"
-    : "Mute speaker";
+  renderRoster();
+  renderSendTarget();
+  prefillSticky();
+  renderRawTemplates();
 }
 
 // ---------------------------------------------------------------- invites
@@ -548,11 +671,12 @@ function renderInvites() {
 // ---------------------------------------------------------------- roster
 
 function updatePresence(
+  call: Call,
   attendeeId: string,
   present: boolean,
   externalUserId?: string,
 ) {
-  let attendee = attendees.get(attendeeId);
+  let attendee = call.attendees.get(attendeeId);
   if (!attendee) {
     attendee = {
       attendeeId,
@@ -563,25 +687,25 @@ function updatePresence(
       signal: 1,
       element: el("li"),
     };
-    attendees.set(attendeeId, attendee);
+    call.attendees.set(attendeeId, attendee);
     const tracked = attendee;
-    session?.audioVideo.realtimeSubscribeToVolumeIndicator(
+    call.session.audioVideo.realtimeSubscribeToVolumeIndicator(
       attendeeId,
       (_id, volume, muted, signal) => {
         if (volume !== null) tracked.volume = volume;
         if (muted !== null) tracked.muted = muted;
         if (signal !== null) tracked.signal = signal;
-        renderAttendee(tracked);
+        if (call.id === selectedCallId) renderAttendee(call, tracked);
       },
     );
   }
   attendee.present = present;
   attendee.externalUserId = externalUserId ?? attendee.externalUserId;
-  renderRoster();
+  renderCalls();
 }
 
-function renderAttendee(attendee: Attendee) {
-  const isSelf = attendee.attendeeId === selfAttendeeId;
+function renderAttendee(call: Call, attendee: Attendee) {
+  const isSelf = attendee.attendeeId === call.selfAttendeeId;
   const userId = slackUserId(attendee.externalUserId);
   const name = el(
     "span",
@@ -613,10 +737,10 @@ function renderAttendee(attendee: Attendee) {
     const mute = el("button", { className: "small" }, "Mute");
     mute.title = "Send a muteRequest PeerMessage";
     mute.onclick = () =>
-      sendPeer({
+      sendPeerTo([call], (self) => ({
         muteRequest: { peerId: attendee.attendeeId },
-        fromPeerIdString: selfAttendeeId,
-      });
+        fromPeerIdString: self,
+      }));
     children.push(mute);
   }
   attendee.element.replaceChildren(...children);
@@ -624,8 +748,12 @@ function renderAttendee(attendee: Attendee) {
 
 function renderRoster() {
   const list = $("#roster");
-  const present = [...attendees.values()].filter((a) => a.present);
-  if (!present.length) {
+  const call = selectedCall();
+  $("#roster-call").textContent = call && calls.size > 1 ? callLabel(call) : "";
+  const present = call
+    ? [...call.attendees.values()].filter((a) => a.present)
+    : [];
+  if (!call || !present.length) {
     list.replaceChildren(
       el(
         "li",
@@ -635,44 +763,112 @@ function renderRoster() {
     );
     return;
   }
-  for (const attendee of present) renderAttendee(attendee);
+  for (const attendee of present) renderAttendee(call, attendee);
   list.replaceChildren(...present.map((a) => a.element));
 }
 
 // ---------------------------------------------------------------- send
 
-function requireSession() {
-  if (!session || callStatus !== "connected")
-    throw new Error("Join a huddle first");
-  return session;
+function renderSendTarget() {
+  const container = $("#send-targets");
+  if (!calls.size) {
+    container.replaceChildren();
+    return;
+  }
+  const boxes = [...calls.values()].map((call) => {
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = sendTargets.has(call.id);
+    box.onchange = () => {
+      if (box.checked) sendTargets.add(call.id);
+      else sendTargets.delete(call.id);
+    };
+    const label = document.createElement("label");
+    label.className = "inline";
+    label.append(box, callLabel(call));
+    return label;
+  });
+  const setAll = (on: boolean) => () => {
+    for (const call of calls.values())
+      if (on) sendTargets.add(call.id);
+      else sendTargets.delete(call.id);
+    renderSendTarget();
+  };
+  const all = el("button", { className: "small", type: "button" }, "All");
+  all.onclick = setAll(true);
+  const none = el("button", { className: "small", type: "button" }, "None");
+  none.onclick = setAll(false);
+  container.replaceChildren(
+    el("span", {}, "Send to"),
+    ...boxes,
+    ...(calls.size > 1 ? [all, none] : []),
+  );
 }
 
-function sendBytes(topic: string, bytes: Uint8Array, lifetimeMs = 0) {
-  const meeting = requireSession();
+/** The connected huddles the Send card is aimed at. */
+function targetCalls() {
+  if (!calls.size) throw new Error("Join a huddle first");
+  const ready = [...calls.values()].filter(
+    (call) => sendTargets.has(call.id) && call.status === "connected",
+  );
+  if (!ready.length) throw new Error("Tick a connected huddle to send to");
+  return ready;
+}
+
+function sendBytes(
+  call: Call,
+  topic: string,
+  bytes: Uint8Array,
+  lifetimeMs = 0,
+) {
   if (bytes.length > maxDataMessageBytes)
     throw new Error(
       `Message is ${bytes.length} bytes; Chime allows ${maxDataMessageBytes}`,
     );
-  meeting.audioVideo.realtimeSendDataMessage(topic, bytes, lifetimeMs);
-  logDataMessage("out", {
+  call.session.audioVideo.realtimeSendDataMessage(topic, bytes, lifetimeMs);
+  logDataMessage(call, "out", {
     topic,
     data: bytes,
-    senderAttendeeId: selfAttendeeId,
+    senderAttendeeId: call.selfAttendeeId,
     timestampMs: Date.now(),
   });
 }
 
-function sendPeer(message: JsonValue, topic = dataChannelTopic) {
+/**
+ * Sends a PeerMessage to each huddle; `build` gets that huddle's own attendee
+ * ID, which Slack's clients put in `fromPeerIdString`.
+ */
+function sendPeerTo(
+  targets: Call[],
+  build: (selfAttendeeId: string, call: Call) => JsonValue,
+  topic = dataChannelTopic,
+) {
   try {
-    sendBytes(topic, encodePeerMessage(message));
+    for (const call of targets)
+      sendBytes(
+        call,
+        topic,
+        encodePeerMessage(build(call.selfAttendeeId, call)),
+      );
+  } catch (error) {
+    toast(errorMessage(error), true);
+  }
+}
+
+function sendPeer(
+  build: (selfAttendeeId: string, call: Call) => JsonValue,
+  topic = dataChannelTopic,
+) {
+  try {
+    sendPeerTo(targetCalls(), build, topic);
   } catch (error) {
     toast(errorMessage(error), true);
   }
 }
 
 function sendReacji(emoji: string, type: ReactionType, emojiUrl?: string) {
-  sendPeer(
-    reacjiMessage({ emoji, type, emojiUrl, fromPeerIdString: selfAttendeeId }),
+  sendPeer((fromPeerIdString) =>
+    reacjiMessage({ emoji, type, emojiUrl, fromPeerIdString }),
   );
 }
 
@@ -801,19 +997,19 @@ gifSearch.addEventListener("submit", (event) => {
 // Sticky
 const stickyForm = $<HTMLFormElement>("#sticky-form");
 function prefillSticky() {
-  const channel = stickyForm.elements.namedItem("channel") as HTMLInputElement;
   const user = stickyForm.elements.namedItem("user") as HTMLInputElement;
-  if (call) channel.value = call.channelId;
-  if (server.identity) user.value = server.identity.userId;
+  if (server.identity && !user.value) user.value = server.identity.userId;
 }
+// An empty channel means each huddle's own channel.
 function sendSticky(emoji: string) {
   const data = new FormData(stickyForm);
-  sendPeer(
+  const channel = String(data.get("channel")).trim();
+  sendPeer((fromPeerIdString, call) =>
     stickyEmojiMessage({
-      channel: String(data.get("channel")).trim(),
+      channel: channel || call.join.channelId,
       user: String(data.get("user")).trim(),
       emoji,
-      fromPeerIdString: selfAttendeeId,
+      fromPeerIdString,
     }),
   );
 }
@@ -830,11 +1026,15 @@ const rawPayload = rawForm.elements.namedItem("payload") as HTMLTextAreaElement;
 const rawEncoding = rawForm.elements.namedItem("encoding") as HTMLSelectElement;
 const rawTopic = rawForm.elements.namedItem("topic") as HTMLInputElement;
 
-function rawBytes() {
+function rawBytes(selfAttendeeId = selfPlaceholder) {
   const payload = rawPayload.value;
   switch (rawEncoding.value) {
     case "peer":
-      return encodePeerMessage(JSON.parse(payload));
+      return encodePeerMessage(
+        JSON.parse(payload, (_key, value) =>
+          value === selfPlaceholder ? selfAttendeeId : value,
+        ),
+      );
     case "hex":
       return hexToBytes(payload);
     case "base64":
@@ -862,8 +1062,11 @@ function loadRaw(topic: string, encoding: string, payload: string) {
   rawPayload.focus();
 }
 
+// Raw PeerMessages may say "SELF" wherever each huddle's own attendee ID goes.
+const selfPlaceholder = "SELF";
+
 function renderRawTemplates() {
-  const self = selfAttendeeId || "ATTENDEE_ID";
+  const self = selfPlaceholder;
   const templates: [string, JsonValue][] = [
     ["Reacji", reacjiMessage({ emoji: ":tada:", fromPeerIdString: self })],
     [
@@ -890,7 +1093,7 @@ function renderRawTemplates() {
       "Awareness query",
       {
         awarenessQuery: {
-          channel: call?.channelId ?? "CHANNEL_ID",
+          channel: selectedCall()?.join.channelId ?? "CHANNEL_ID",
           user: server.identity?.userId ?? "USER_ID",
         },
         fromPeerIdString: self,
@@ -920,7 +1123,13 @@ rawForm.addEventListener("submit", (event) => {
     const lifetime = Number(
       (rawForm.elements.namedItem("lifetime") as HTMLInputElement).value,
     );
-    sendBytes(rawTopic.value.trim(), rawBytes(), lifetime || 0);
+    for (const call of targetCalls())
+      sendBytes(
+        call,
+        rawTopic.value.trim(),
+        rawBytes(call.selfAttendeeId),
+        lifetime || 0,
+      );
   } catch (error) {
     toast(errorMessage(error), true);
   }
@@ -936,7 +1145,10 @@ function renderTopics() {
         const remove = el("button", { className: "small remove" }, "×");
         remove.onclick = () => {
           topics.delete(topic);
-          session?.audioVideo.realtimeUnsubscribeFromReceiveDataMessage(topic);
+          for (const call of calls.values())
+            call.session.audioVideo.realtimeUnsubscribeFromReceiveDataMessage(
+              topic,
+            );
           renderTopics();
         };
         chip.append(remove);
@@ -951,7 +1163,7 @@ $("#topic-add").addEventListener("click", () => {
   const topic = input.value.trim();
   if (!topic || topics.has(topic)) return;
   topics.add(topic);
-  subscribeTopic(topic);
+  for (const call of calls.values()) subscribeTopic(call, topic);
   input.value = "";
   renderTopics();
 });
@@ -961,6 +1173,7 @@ $("#data-clear").addEventListener("click", () =>
 );
 
 function logDataMessage(
+  call: Call,
   direction: "in" | "out",
   message: Pick<
     DataMessage,
@@ -983,6 +1196,7 @@ function logDataMessage(
     direction === "out"
       ? "you"
       : describeAttendee(
+          call,
           message.senderAttendeeId,
           message.senderExternalUserId,
         ),
@@ -1020,6 +1234,9 @@ function logDataMessage(
       { className: "meta" },
       el("span", {}, direction === "in" ? "⬇" : "⬆"),
       el("span", {}, time(message.timestampMs)),
+      ...(calls.size > 1
+        ? [el("span", { className: "tag" }, callLabel(call))]
+        : []),
       el("strong", {}, message.topic),
       el("span", {}, kind ?? (text !== undefined ? "text" : "bytes")),
       sender,

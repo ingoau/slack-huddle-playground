@@ -31,14 +31,24 @@ only if you tick "Remember". The server only answers requests whose `Host` and
   accept an invite that arrives over the realtime socket (`huddle_invite`).
   The page joins the Amazon Chime meeting itself, muted and sending silence;
   you can unmute or switch to your microphone, and you hear the huddle. Join
-  as many huddles as you like at once, or the same huddle several times
-  (× count); each is its own Chime connection with its own controls.
+  as many huddles as you like at once, or the same huddle any number of
+  times (× count); each is its own Chime connection with its own controls.
+- **Backends**: pick how each join connects.
+  - _Chime SDK (this page)_: `amazon-chime-sdk-js` in the browser, with audio
+    you can hear and a microphone. Left when the tab closes.
+  - _Native (server)_: the server joins Chime itself, without a browser or the
+    SDK, using HuddleFM's native Chime link (protobuf signaling and a
+    relay-only `node-datachannel` peer) sending silence. No audio to hear,
+    but it's light enough for many joins, and native huddles stay joined
+    across page reloads until you leave or disconnect.
 - **Participants**: Chime attendee presence, with Slack names, mute state,
   volume, and a button that sends a `muteRequest`.
 - **Send**: to any mix of joined huddles, ticked at the top of the card.
   In raw PeerMessage JSON, `"SELF"` becomes each huddle's own attendee ID.
-  - Reaction: emoji with any type and `emojiUrl`, repeatable to try Slack's
-    "explosion".
+  - Reaction: emoji with any type and `emojiUrl`, repeated any number of
+    times at any interval, or looped until you stop it. Native huddles repeat
+    on the server, which sends each round itself; SDK huddles repeat on a
+    timer in the page.
   - Effect: effect reacji such as `gong`.
   - GIF: search Slack's own GIF picker (`gif.search`), or paste any URL.
   - Sticky: the emoji pinned to your tile.
@@ -69,7 +79,8 @@ message Reacji {
   `<img>` without Slack's image proxy.
 - Sticky emoji go as an `awarenessBroadcast` with the field `stickyEmoji`. The
   page fills its `channel` with the huddle's channel; that part is a guess.
-- Chime caps a data message at 2 KiB.
+- Chime documents 2 KiB as the most a data message carries; the page shows
+  the size but doesn't stop you sending more.
 
 ## Development
 

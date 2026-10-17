@@ -1,4 +1,7 @@
 import type { ServerWebSocket } from "bun";
+import { NativeCall } from "./src/native/native-call.ts";
+import { ReactionLoop } from "./src/native/reaction-loop.ts";
+import { reactionTypes, type ReactionType } from "./src/peer-message.ts";
 import {
   normalizeWorkspaceUrl,
   RealtimeConnection,
@@ -32,6 +35,11 @@ let realtimeStatus = "offline";
 const sockets = new Set<ServerWebSocket<unknown>>();
 // Replayed to a page that connects later, so a refresh keeps recent events.
 const recentEvents: UiMessage[] = [];
+// Huddles joined natively live here, not in the page, so they outlast it.
+const nativeCalls = new Map<string, NativeCall>();
+let nextNativeId = 1;
+const reactionLoops = new Map<string, ReactionLoop>();
+let nextLoopId = 1;
 
 function broadcast(message: UiMessage) {
   if (message.kind === "rtm") {
@@ -82,6 +90,8 @@ async function connect(credentials: Credentials) {
 }
 
 function disconnect() {
+  for (const loop of reactionLoops.values()) loop.stop("disconnected");
+  for (const call of nativeCalls.values()) void leaveNative(call);
   realtime?.stop();
   realtime = undefined;
   slack = undefined;
@@ -89,6 +99,71 @@ function disconnect() {
   realtimeStatus = "offline";
   recentEvents.length = 0;
   broadcast({ kind: "state", ...state() });
+}
+
+async function joinNative(join: Awaited<ReturnType<SlackClient["join"]>>) {
+  const id = `n${nextNativeId++}`;
+  const call = new NativeCall(
+    id,
+    join.channelId,
+    join.callId,
+    join.meeting,
+    join.attendee,
+    (event) => broadcast({ kind: "native", id, event }),
+    (message) => console.log(`[native ${id}] ${message}`),
+  );
+  nativeCalls.set(id, call);
+  // The page hears how it goes through status events.
+  call.start().catch(() => {});
+  return call.info();
+}
+
+async function leaveNative(call: NativeCall) {
+  if (!nativeCalls.delete(call.id)) return;
+  await call.leave().catch(() => {});
+  broadcast({ kind: "native-left", id: call.id });
+  await slack
+    ?.leave(call.channelId, call.callId, call.attendeeId)
+    .catch(() => {});
+}
+
+function startReactionLoop(body: Record<string, unknown>) {
+  const callIds = body.callIds;
+  if (!Array.isArray(callIds) || !callIds.every((id) => nativeCalls.has(id)))
+    throw new HttpError(400, "callIds must list native huddles");
+  const type = body.type as ReactionType | undefined;
+  if (type !== undefined && !reactionTypes.includes(type))
+    throw new HttpError(400, `type must be one of ${reactionTypes.join(", ")}`);
+  const count = body.count === undefined ? undefined : Number(body.count);
+  const id = `loop${nextLoopId++}`;
+  const loop = new ReactionLoop(
+    id,
+    {
+      callIds,
+      emoji: string(body, "emoji"),
+      type,
+      emojiUrl:
+        typeof body.emojiUrl === "string" && body.emojiUrl
+          ? body.emojiUrl
+          : undefined,
+      intervalMs: Math.max(0, Number(body.intervalMs) || 0),
+      count: count !== undefined && count > 0 ? Math.floor(count) : undefined,
+    },
+    nativeCalls,
+    (state) => {
+      if (!state.running) reactionLoops.delete(id);
+      broadcast({ kind: "reaction-loop", state });
+    },
+  );
+  reactionLoops.set(id, loop);
+  loop.start();
+  return loop.state();
+}
+
+function requireNative(body: Record<string, unknown>) {
+  const call = nativeCalls.get(string(body, "id"));
+  if (!call) throw new HttpError(404, "No such native huddle");
+  return call;
 }
 
 function requireSlack() {
@@ -218,6 +293,61 @@ const server = Bun.serve({
         ),
       ),
     },
+    "/api/native/join": {
+      POST: api(async (body) =>
+        joinNative(
+          await requireSlack().join(
+            string(body, "channelId"),
+            typeof body.region === "string" && body.region
+              ? body.region
+              : "us-east-1",
+          ),
+        ),
+      ),
+    },
+    "/api/native/join-invite": {
+      POST: api(async (body) =>
+        joinNative(
+          await requireSlack().joinInvite(
+            string(body, "channelId"),
+            string(body, "callId"),
+            body.freeWilly,
+          ),
+        ),
+      ),
+    },
+    "/api/native/leave": {
+      POST: api(async (body) => {
+        await leaveNative(requireNative(body));
+        return { ok: true };
+      }),
+    },
+    "/api/native/send": {
+      POST: api((body) => {
+        const call = requireNative(body);
+        call.send(
+          string(body, "topic"),
+          Buffer.from(String(body.data ?? ""), "base64"),
+          Number(body.lifetimeMs) || 0,
+        );
+        return { ok: true };
+      }),
+    },
+    "/api/native/reaction-loop": {
+      POST: api((body) => startReactionLoop(body)),
+    },
+    "/api/native/reaction-loop/stop": {
+      POST: api((body) => {
+        reactionLoops.get(string(body, "id"))?.stop();
+        return { ok: true };
+      }),
+    },
+    "/api/native/mute": {
+      POST: api((body) => {
+        requireNative(body).setMuted(Boolean(body.muted));
+        return { ok: true };
+      }),
+    },
     "/api/decline": {
       POST: api((body) =>
         requireSlack().declineInvite(
@@ -259,6 +389,16 @@ const server = Bun.serve({
     open(socket) {
       sockets.add(socket);
       socket.send(JSON.stringify({ kind: "state", ...state() }));
+      socket.send(
+        JSON.stringify({
+          kind: "native-calls",
+          calls: [...nativeCalls.values()].map((call) => call.info()),
+        }),
+      );
+      for (const loop of reactionLoops.values())
+        socket.send(
+          JSON.stringify({ kind: "reaction-loop", state: loop.state() }),
+        );
       for (const message of recentEvents) socket.send(JSON.stringify(message));
     },
     close(socket) {

@@ -18,8 +18,15 @@ import {
   transcriptCatchUpTopic,
   type ReactionType,
 } from "./peer-message.ts";
+import type {
+  NativeAttendee,
+  NativeCallInfo,
+  NativeEvent,
+} from "./native/native-call.ts";
+import type { ReactionLoopState } from "./native/reaction-loop.ts";
 
-// Chime refuses data messages over 2 KiB.
+// Chime documents 2 KiB as the most a data message can carry; the page shows
+// it but sends whatever you give it.
 const maxDataMessageBytes = 2048;
 // Topics whose payloads are PeerMessages in Slack's client.
 const peerTopics = new Set([dataChannelTopic, transcriptCatchUpTopic]);
@@ -142,7 +149,11 @@ function bytesToHex(bytes: Uint8Array) {
 }
 
 function bytesToBase64(bytes: Uint8Array) {
-  return btoa(String.fromCharCode(...bytes));
+  let binary = "";
+  // In chunks, so large payloads don't overflow the argument list.
+  for (let i = 0; i < bytes.length; i += 0x8000)
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
 }
 
 function hexToBytes(hex: string) {
@@ -169,19 +180,26 @@ function printable(bytes: Uint8Array) {
 
 // ---------------------------------------------------------------- state
 
-/** One joined huddle, with its own Chime session and audio. */
+/**
+ * One joined huddle: either a Chime SDK session in this page, with its own
+ * audio, or a native connection the server holds.
+ */
 type Call = {
   /** Local ID; the same huddle can be joined more than once. */
   id: string;
-  join: ChimeJoin;
-  session: DefaultMeetingSession;
+  backend: "sdk" | "native";
+  join: { channelId: string; callId: string };
+  meetingId: string;
   selfAttendeeId: string;
   status: string;
   attendees: Map<string, Attendee>;
   micMuted: boolean;
-  usingMic: boolean;
-  speakerMuted: boolean;
-  audio: HTMLAudioElement;
+  sdk?: {
+    session: DefaultMeetingSession;
+    audio: HTMLAudioElement;
+    usingMic: boolean;
+    speakerMuted: boolean;
+  };
   /** The channel's name once Slack tells us. */
   channelName: string;
   /** Which connection to this huddle this is, from 1. */
@@ -334,27 +352,47 @@ function describeAttendee(
 
 // ---------------------------------------------------------------- huddle
 
+type Backend = "sdk" | "native";
 const joinForm = $<HTMLFormElement>("#join-form");
+
+function joinBackend(): Backend {
+  return new FormData(joinForm).get("backend") === "native" ? "native" : "sdk";
+}
+
 joinForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const data = new FormData(joinForm);
-  const count = Math.max(1, Math.min(20, Number(data.get("count")) || 1));
+  const count = Math.max(1, Math.floor(Number(data.get("count")) || 1));
+  const body = {
+    channelId: String(data.get("channelId")).trim(),
+    region: String(data.get("region")),
+  };
+  const backend = joinBackend();
   // One at a time, so each rooms.join sees the previous connection.
   for (let i = 0; i < count; i++)
-    await joinWith(() =>
-      post<ChimeJoin>("/api/join", {
-        channelId: String(data.get("channelId")).trim(),
-        region: String(data.get("region")),
-      }),
-    );
+    await joinWith(backend, (path) => post(path, body), "/api/join");
 });
 
 let joining = 0;
-async function joinWith(request: () => Promise<ChimeJoin>) {
+/**
+ * Joins with the chosen backend. `path` is the Slack join route; native
+ * joins use its `/api/native/…` twin, which also connects on the server.
+ */
+async function joinWith(
+  backend: Backend,
+  request: (path: string) => Promise<unknown>,
+  path: string,
+) {
   joining++;
   renderCalls();
   try {
-    await startChime(await request());
+    if (backend === "native")
+      addNativeCall(
+        (await request(
+          path.replace("/api/", "/api/native/"),
+        )) as NativeCallInfo,
+      );
+    else await startChime((await request(path)) as ChimeJoin);
   } catch (error) {
     toast(`Could not join: ${errorMessage(error)}`, true);
   } finally {
@@ -366,6 +404,44 @@ async function joinWith(request: () => Promise<ChimeJoin>) {
 function silentStream() {
   audioContext ??= new AudioContext();
   return audioContext.createMediaStreamDestination().stream;
+}
+
+/** Registers a new call, numbering repeat joins of the same huddle. */
+function addCall(
+  fields: Omit<Call, "channelName" | "copy" | "attendees" | "status">,
+  status = "connecting",
+) {
+  const siblings = [...calls.values()].filter(
+    (other) => other.join.callId === fields.join.callId,
+  );
+  const call: Call = {
+    ...fields,
+    status,
+    attendees: new Map(),
+    channelName: siblings[0]?.channelName ?? fields.join.channelId,
+    copy: Math.max(0, ...siblings.map((other) => other.copy)) + 1,
+  };
+  // Chime allows one connection per attendee, so a repeat attendee would
+  // knock the earlier connection out.
+  if (siblings.some((other) => other.selfAttendeeId === call.selfAttendeeId))
+    toast(
+      "Slack reused an attendee ID, so the earlier connection will likely drop",
+      true,
+    );
+  calls.set(call.id, call);
+  selectedCallId = call.id;
+  sendTargets.add(call.id);
+  void post<{ channel?: { name?: string } }>("/api/slack", {
+    method: "conversations.info",
+    fields: { channel: call.join.channelId },
+  })
+    .then((result) => {
+      if (result.channel?.name) call.channelName = `#${result.channel.name}`;
+      renderCalls();
+    })
+    .catch(() => {});
+  renderCalls();
+  return call;
 }
 
 async function startChime(join: ChimeJoin) {
@@ -381,42 +457,20 @@ async function startChime(join: ChimeJoin) {
   );
   const audio = el("audio", { autoplay: true });
   document.body.append(audio);
-  const siblings = [...calls.values()].filter(
-    (other) => other.join.callId === join.callId,
-  );
-  const call: Call = {
+  const call = addCall({
     id: String(nextCallId++),
+    backend: "sdk",
     join,
-    session,
+    meetingId: String(
+      (join.meeting.Meeting as Record<string, unknown> | undefined)
+        ?.MeetingId ??
+        join.meeting.MeetingId ??
+        "",
+    ),
     selfAttendeeId: configuration.credentials?.attendeeId ?? "",
-    status: "connecting",
-    attendees: new Map(),
     micMuted: true,
-    usingMic: false,
-    speakerMuted: false,
-    audio,
-    channelName: siblings[0]?.channelName ?? join.channelId,
-    copy: Math.max(0, ...siblings.map((other) => other.copy)) + 1,
-  };
-  // Chime allows one connection per attendee, so a repeat attendee would
-  // knock the earlier connection out.
-  if (siblings.some((other) => other.selfAttendeeId === call.selfAttendeeId))
-    toast(
-      "Slack reused an attendee ID, so the earlier connection will likely drop",
-      true,
-    );
-  calls.set(call.id, call);
-  selectedCallId = call.id;
-  sendTargets.add(call.id);
-  void post<{ channel?: { name?: string } }>("/api/slack", {
-    method: "conversations.info",
-    fields: { channel: join.channelId },
-  })
-    .then((result) => {
-      if (result.channel?.name) call.channelName = `#${result.channel.name}`;
-      renderCalls();
-    })
-    .catch(() => {});
+    sdk: { session, audio, usingMic: false, speakerMuted: false },
+  });
 
   const audioVideo = session.audioVideo;
   audioVideo.addObserver({
@@ -445,28 +499,80 @@ async function startChime(join: ChimeJoin) {
   await audioVideo.startAudioInput(silentStream());
   audioVideo.start();
   audioVideo.realtimeMuteLocalAudio();
+}
 
+/** A huddle the server joined; it reports back over the page's socket. */
+function addNativeCall(info: NativeCallInfo) {
+  if (calls.has(info.id)) return;
+  const call = addCall(
+    {
+      id: info.id,
+      backend: "native",
+      join: { channelId: info.channelId, callId: info.callId },
+      meetingId: info.meetingId,
+      selfAttendeeId: info.attendeeId,
+      micMuted: info.muted,
+    },
+    info.status,
+  );
+  for (const attendee of info.attendees) updateNativeAttendee(call, attendee);
+}
+
+function onNativeEvent(id: string, event: NativeEvent) {
+  const call = calls.get(id);
+  if (!call) return;
+  if (event.type === "status") {
+    const was = call.status;
+    call.status = event.status;
+    if (event.status === "connected" && was !== "connected")
+      toast(`Joined ${callLabel(call)} natively`);
+    if (event.status.startsWith("failed"))
+      toast(`${callLabel(call)}: ${event.status}`, true);
+    renderCalls();
+  } else if (event.type === "attendee") {
+    updateNativeAttendee(call, event.attendee);
+  } else if (event.type === "data" && topics.has(event.topic)) {
+    logDataMessage(call, "in", {
+      topic: event.topic,
+      data: base64ToBytes(event.data),
+      senderAttendeeId: event.senderAttendeeId,
+      senderExternalUserId: event.senderExternalUserId,
+      timestampMs: event.timestampMs,
+    });
+  }
+}
+
+/** Drops a call from the page without telling Slack. */
+function forgetCall(call: Call) {
+  if (calls.get(call.id) !== call) return false;
+  calls.delete(call.id);
+  sendTargets.delete(call.id);
+  if (selectedCallId === call.id) selectedCallId = calls.keys().next().value;
   renderCalls();
+  return true;
 }
 
 function subscribeTopic(call: Call, topic: string) {
-  call.session.audioVideo.realtimeSubscribeToReceiveDataMessage(
+  call.sdk?.session.audioVideo.realtimeSubscribeToReceiveDataMessage(
     topic,
     (message: DataMessage) => logDataMessage(call, "in", message),
   );
 }
 
 async function leave(call: Call) {
-  if (calls.get(call.id) !== call) return;
-  calls.delete(call.id);
-  sendTargets.delete(call.id);
-  if (selectedCallId === call.id) selectedCallId = calls.keys().next().value;
-  call.session.audioVideo.stop();
-  await call.session.audioVideo.stopAudioInput().catch(() => {});
-  call.session.audioVideo.unbindAudioElement();
-  call.audio.remove();
+  if (!forgetCall(call)) return;
+  if (call.backend === "native") {
+    await post("/api/native/leave", { id: call.id }).catch((error) =>
+      toast(`Leave: ${errorMessage(error)}`, true),
+    );
+    return;
+  }
+  const { session, audio } = call.sdk!;
+  session.audioVideo.stop();
+  await session.audioVideo.stopAudioInput().catch(() => {});
+  session.audioVideo.unbindAudioElement();
+  audio.remove();
   releaseMicIfUnused();
-  renderCalls();
   await post("/api/leave", leaveBody(call)).catch((error) =>
     toast(`rooms.leave: ${errorMessage(error)}`, true),
   );
@@ -480,32 +586,42 @@ function leaveBody(call: Call) {
   };
 }
 
-// Tell Slack we left when the tab closes, as Slack's own client does.
+// Tell Slack we left when the tab closes, as Slack's own client does. Native
+// huddles live on the server and stay.
 addEventListener("pagehide", () => {
   for (const call of calls.values())
-    void fetch("/api/leave", {
-      method: "POST",
-      keepalive: true,
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(leaveBody(call)),
-    });
+    if (call.backend === "sdk")
+      void fetch("/api/leave", {
+        method: "POST",
+        keepalive: true,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(leaveBody(call)),
+      });
 });
 
 function toggleMute(call: Call) {
-  if (call.micMuted) call.session.audioVideo.realtimeUnmuteLocalAudio();
-  else call.session.audioVideo.realtimeMuteLocalAudio();
   call.micMuted = !call.micMuted;
+  if (call.sdk) {
+    if (call.micMuted) call.sdk.session.audioVideo.realtimeMuteLocalAudio();
+    else call.sdk.session.audioVideo.realtimeUnmuteLocalAudio();
+  } else {
+    void post("/api/native/mute", { id: call.id, muted: call.micMuted }).catch(
+      (error) => toast(errorMessage(error), true),
+    );
+  }
   renderCalls();
 }
 
 // Every huddle using the microphone shares one capture.
 async function toggleMicSource(call: Call) {
+  const sdk = call.sdk;
+  if (!sdk) return;
   try {
-    if (!call.usingMic)
+    if (!sdk.usingMic)
       micStream ??= await navigator.mediaDevices.getUserMedia({ audio: true });
-    call.usingMic = !call.usingMic;
-    await call.session.audioVideo.startAudioInput(
-      call.usingMic ? micStream! : silentStream(),
+    sdk.usingMic = !sdk.usingMic;
+    await sdk.session.audioVideo.startAudioInput(
+      sdk.usingMic ? micStream! : silentStream(),
     );
     releaseMicIfUnused();
     renderCalls();
@@ -515,14 +631,16 @@ async function toggleMicSource(call: Call) {
 }
 
 function releaseMicIfUnused() {
-  if (!micStream || [...calls.values()].some((call) => call.usingMic)) return;
+  if (!micStream || [...calls.values()].some((call) => call.sdk?.usingMic))
+    return;
   for (const track of micStream.getTracks()) track.stop();
   micStream = undefined;
 }
 
 function toggleSpeaker(call: Call) {
-  call.speakerMuted = !call.speakerMuted;
-  call.audio.muted = call.speakerMuted;
+  if (!call.sdk) return;
+  call.sdk.speakerMuted = !call.sdk.speakerMuted;
+  call.sdk.audio.muted = call.sdk.speakerMuted;
   renderCalls();
 }
 
@@ -560,15 +678,21 @@ function renderCalls() {
         el(
           "span",
           { className: "sub" },
-          `${call.status} · ${present.length} here · ${call.selfAttendeeId}`,
+          `${call.backend === "native" ? "native" : "SDK"} · ${call.status} · ${present.length} here · ${call.selfAttendeeId}`,
         ),
       ),
       button(call.micMuted ? "Unmute" : "Mute", () => toggleMute(call)),
-      button(
-        call.usingMic ? "Silence" : "Mic",
-        () => void toggleMicSource(call),
-      ),
-      button(call.speakerMuted ? "🔇" : "🔊", () => toggleSpeaker(call)),
+      ...(call.sdk
+        ? [
+            button(
+              call.sdk.usingMic ? "Silence" : "Mic",
+              () => void toggleMicSource(call),
+            ),
+            button(call.sdk.speakerMuted ? "🔇" : "🔊", () =>
+              toggleSpeaker(call),
+            ),
+          ]
+        : []),
       button("Leave", () => void leave(call), "small danger"),
     );
     row.title = "Select to see participants and details";
@@ -584,14 +708,12 @@ function renderCalls() {
         ["Channel", call.join.channelId],
         ["Call", call.join.callId],
         ["Attendee", call.selfAttendeeId],
+        ["Meeting", call.meetingId],
         [
-          "Meeting",
-          String(
-            (call.join.meeting.Meeting as Record<string, unknown> | undefined)
-              ?.MeetingId ??
-              call.join.meeting.MeetingId ??
-              "",
-          ),
+          "Backend",
+          call.backend === "native"
+            ? "Native (server, no media)"
+            : "Chime SDK (this page)",
         ],
       ]
     : [];
@@ -628,12 +750,11 @@ function renderInvites() {
       join.onclick = () => {
         invites.delete(callId);
         renderInvites();
-        void joinWith(() =>
-          post<ChimeJoin>("/api/join-invite", {
-            channelId,
-            callId,
-            freeWilly: invite.free_willy,
-          }),
+        void joinWith(
+          joinBackend(),
+          (path) =>
+            post(path, { channelId, callId, freeWilly: invite.free_willy }),
+          "/api/join-invite",
         );
       };
       const decline = el("button", { className: "small" }, "Decline");
@@ -670,6 +791,18 @@ function renderInvites() {
 
 // ---------------------------------------------------------------- roster
 
+function updateNativeAttendee(call: Call, state: NativeAttendee) {
+  let attendee = call.attendees.get(state.attendeeId);
+  const presenceChanged = attendee?.present !== state.present;
+  if (!attendee) {
+    attendee = { ...state, signal: 1, element: el("li") };
+    call.attendees.set(state.attendeeId, attendee);
+  } else Object.assign(attendee, state);
+  // Volume changes only redraw the one row.
+  if (presenceChanged) renderCalls();
+  else if (call.id === selectedCallId) renderAttendee(call, attendee);
+}
+
 function updatePresence(
   call: Call,
   attendeeId: string,
@@ -689,9 +822,14 @@ function updatePresence(
     };
     call.attendees.set(attendeeId, attendee);
     const tracked = attendee;
-    call.session.audioVideo.realtimeSubscribeToVolumeIndicator(
+    call.sdk?.session.audioVideo.realtimeSubscribeToVolumeIndicator(
       attendeeId,
-      (_id, volume, muted, signal) => {
+      (
+        _id: string,
+        volume: number | null,
+        muted: boolean | null,
+        signal: number | null,
+      ) => {
         if (volume !== null) tracked.volume = volume;
         if (muted !== null) tracked.muted = muted;
         if (signal !== null) tracked.signal = signal;
@@ -821,11 +959,21 @@ function sendBytes(
   bytes: Uint8Array,
   lifetimeMs = 0,
 ) {
-  if (bytes.length > maxDataMessageBytes)
-    throw new Error(
-      `Message is ${bytes.length} bytes; Chime allows ${maxDataMessageBytes}`,
+  if (call.sdk)
+    call.sdk.session.audioVideo.realtimeSendDataMessage(
+      topic,
+      bytes,
+      lifetimeMs,
     );
-  call.session.audioVideo.realtimeSendDataMessage(topic, bytes, lifetimeMs);
+  else
+    void post("/api/native/send", {
+      id: call.id,
+      topic,
+      data: bytesToBase64(bytes),
+      lifetimeMs,
+    }).catch((error) =>
+      toast(`${callLabel(call)}: ${errorMessage(error)}`, true),
+    );
   logDataMessage(call, "out", {
     topic,
     data: bytes,
@@ -901,18 +1049,126 @@ for (const tab of document.querySelectorAll<HTMLButtonElement>(
 // Reaction
 const reactionForm = $<HTMLFormElement>("#reaction-form");
 chips("#emoji-chips", quickEmoji, (emoji) => sendReacji(emoji, "Standard"));
-reactionForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
+function reactionFromForm() {
   const data = new FormData(reactionForm);
-  const emoji = String(data.get("emoji")).trim();
-  const type = String(data.get("type")) as ReactionType;
-  const emojiUrl = String(data.get("emojiUrl")).trim() || undefined;
-  const repeat = Math.max(1, Math.min(100, Number(data.get("repeat")) || 1));
-  const interval = Math.max(20, Number(data.get("interval")) || 150);
-  for (let i = 0; i < repeat; i++) {
-    if (i) await new Promise((resolve) => setTimeout(resolve, interval));
-    sendReacji(emoji, type, emojiUrl);
+  return {
+    emoji: String(data.get("emoji")).trim(),
+    type: String(data.get("type")) as ReactionType,
+    emojiUrl: String(data.get("emojiUrl")).trim() || undefined,
+    repeat: Math.max(1, Math.floor(Number(data.get("repeat")) || 1)),
+    interval: Math.max(0, Number(data.get("interval")) || 0),
+  };
+}
+
+// Native huddles repeat on the server, which sends each round itself; huddles
+// in this page repeat on a timer here.
+const serverLoops = new Map<string, ReactionLoopState>();
+let browserLoop: ReturnType<typeof setTimeout> | undefined;
+const loopButton = $<HTMLButtonElement>("#reaction-loop");
+
+function renderLoopButton() {
+  const running = Boolean(browserLoop) || serverLoops.size > 0;
+  const rounds = [...serverLoops.values()].reduce(
+    (total, loop) => total + loop.rounds,
+    0,
+  );
+  loopButton.textContent = running
+    ? `Stop${rounds ? ` (${rounds} sent)` : ""}`
+    : "Start loop";
+  loopButton.classList.toggle("danger", running);
+}
+
+function onReactionLoop(state: ReactionLoopState) {
+  if (state.running) serverLoops.set(state.id, state);
+  else serverLoops.delete(state.id);
+  renderLoopButton();
+}
+
+async function startServerLoop(
+  native: Call[],
+  reaction: ReturnType<typeof reactionFromForm>,
+  count?: number,
+) {
+  try {
+    onReactionLoop(
+      await post<ReactionLoopState>("/api/native/reaction-loop", {
+        callIds: native.map((call) => call.id),
+        emoji: reaction.emoji,
+        type: reaction.type,
+        emojiUrl: reaction.emojiUrl,
+        intervalMs: reaction.interval,
+        count,
+      }),
+    );
+  } catch (error) {
+    toast(`Server loop: ${errorMessage(error)}`, true);
   }
+}
+
+/**
+ * Sends the form's reaction from this page every `interval` ms, `count`
+ * times or until stopped. It reads the form on every round, so edits apply
+ * while it runs.
+ */
+function startBrowserLoop(count?: number) {
+  let sent = 0;
+  const tick = () => {
+    const { emoji, type, emojiUrl, interval } = reactionFromForm();
+    const sdk = [...calls.values()].filter(
+      (call) =>
+        call.backend === "sdk" &&
+        sendTargets.has(call.id) &&
+        call.status === "connected",
+    );
+    if (!sdk.length) return stopBrowserLoop();
+    sendPeerTo(sdk, (fromPeerIdString) =>
+      reacjiMessage({ emoji, type, emojiUrl, fromPeerIdString }),
+    );
+    if (count !== undefined && ++sent >= count) return stopBrowserLoop();
+    browserLoop = setTimeout(tick, interval);
+  };
+  browserLoop = setTimeout(tick, 0);
+  renderLoopButton();
+}
+
+function stopBrowserLoop() {
+  clearTimeout(browserLoop);
+  browserLoop = undefined;
+  renderLoopButton();
+}
+
+/** Starts sending to the ticked huddles; `count` unset runs until stopped. */
+function startReactions(count?: number) {
+  let targets: Call[];
+  try {
+    targets = targetCalls();
+  } catch (error) {
+    toast(errorMessage(error), true);
+    return;
+  }
+  const reaction = reactionFromForm();
+  const native = targets.filter((call) => call.backend === "native");
+  if (native.length) void startServerLoop(native, reaction, count);
+  if (native.length < targets.length) startBrowserLoop(count);
+}
+
+reactionForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const { emoji, type, emojiUrl, repeat } = reactionFromForm();
+  if (repeat === 1) sendReacji(emoji, type, emojiUrl);
+  else startReactions(repeat);
+});
+
+loopButton.addEventListener("click", () => {
+  if (browserLoop || serverLoops.size) {
+    stopBrowserLoop();
+    for (const id of serverLoops.keys())
+      void post("/api/native/reaction-loop/stop", { id }).catch((error) =>
+        toast(errorMessage(error), true),
+      );
+    return;
+  }
+  if (reactionForm.reportValidity()) startReactions();
 });
 
 // Effect
@@ -1146,7 +1402,7 @@ function renderTopics() {
         remove.onclick = () => {
           topics.delete(topic);
           for (const call of calls.values())
-            call.session.audioVideo.realtimeUnsubscribeFromReceiveDataMessage(
+            call.sdk?.session.audioVideo.realtimeUnsubscribeFromReceiveDataMessage(
               topic,
             );
           renderTopics();
@@ -1352,6 +1608,26 @@ function connectServer() {
       renderIdentity();
     } else if (data.kind === "rtm") {
       logEvent(data.at, data.event);
+    } else if (data.kind === "native") {
+      onNativeEvent(data.id, data.event);
+    } else if (data.kind === "reaction-loop") {
+      onReactionLoop(data.state);
+    } else if (data.kind === "native-left") {
+      const call = calls.get(data.id);
+      if (call) forgetCall(call);
+    } else if (data.kind === "native-calls") {
+      // The server's native huddles outlast the page; adopt them, and drop
+      // any it no longer has.
+      // Running loops follow this snapshot.
+      serverLoops.clear();
+      renderLoopButton();
+      const live = new Set<string>();
+      for (const info of data.calls as NativeCallInfo[]) {
+        live.add(info.id);
+        addNativeCall(info);
+      }
+      for (const call of [...calls.values()])
+        if (call.backend === "native" && !live.has(call.id)) forgetCall(call);
     }
   });
   socket.addEventListener("close", () => {

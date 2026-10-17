@@ -13,6 +13,8 @@ const build = await Bun.build({
   entrypoints: [new URL("./src/client.ts", import.meta.url).pathname],
   target: "browser",
   sourcemap: "inline",
+  // The Chime SDK's dependencies expect Node's `global`.
+  define: { global: "globalThis" },
 });
 if (!build.success) {
   for (const log of build.logs) console.error(log);

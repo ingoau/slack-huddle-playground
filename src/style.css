@@ -527,3 +527,11 @@ code {
 #call-facts:not(:empty) {
   margin-top: 10px;
 }
+
+.log-controls {
+  margin-bottom: 8px;
+}
+
+.log-controls .hint {
+  margin: 0;
+}

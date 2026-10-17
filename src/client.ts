@@ -340,6 +340,24 @@ function userName(userId: string) {
   return name;
 }
 
+const channelNames = new Map<string, Promise<string | undefined>>();
+/** `#name` for a channel, asked of Slack once per channel. */
+function channelName(channelId: string) {
+  let name = channelNames.get(channelId);
+  if (!name) {
+    name = post<{ channel?: { name?: string } }>("/api/slack", {
+      method: "conversations.info",
+      fields: { channel: channelId },
+    })
+      .then((result) =>
+        result.channel?.name ? `#${result.channel.name}` : undefined,
+      )
+      .catch(() => undefined);
+    channelNames.set(channelId, name);
+  }
+  return name;
+}
+
 function describeAttendee(
   call: Call,
   attendeeId: string,
@@ -367,10 +385,18 @@ joinForm.addEventListener("submit", async (event) => {
     channelId: String(data.get("channelId")).trim(),
     region: String(data.get("region")),
   };
+  const parallel = Math.max(1, Math.floor(Number(data.get("parallel")) || 1));
   const backend = joinBackend();
-  // One at a time, so each rooms.join sees the previous connection.
-  for (let i = 0; i < count; i++)
-    await joinWith(backend, (path) => post(path, body), "/api/join");
+  // `parallel` joins run at a time until `count` have been made. Slack may
+  // rate-limit rooms.join if too many run at once.
+  let started = 0;
+  const worker = async () => {
+    while (started < count) {
+      started++;
+      await joinWith(backend, (path) => post(path, body), "/api/join");
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(parallel, count) }, worker));
 });
 
 let joining = 0;
@@ -431,15 +457,11 @@ function addCall(
   calls.set(call.id, call);
   selectedCallId = call.id;
   sendTargets.add(call.id);
-  void post<{ channel?: { name?: string } }>("/api/slack", {
-    method: "conversations.info",
-    fields: { channel: call.join.channelId },
-  })
-    .then((result) => {
-      if (result.channel?.name) call.channelName = `#${result.channel.name}`;
-      renderCalls();
-    })
-    .catch(() => {});
+  void channelName(call.join.channelId).then((name) => {
+    if (!name) return;
+    call.channelName = name;
+    renderCalls();
+  });
   renderCalls();
   return call;
 }
@@ -511,7 +533,7 @@ function addNativeCall(info: NativeCallInfo) {
       join: { channelId: info.channelId, callId: info.callId },
       meetingId: info.meetingId,
       selfAttendeeId: info.attendeeId,
-      micMuted: info.muted,
+      micMuted: true,
     },
     info.status,
   );
@@ -600,15 +622,10 @@ addEventListener("pagehide", () => {
 });
 
 function toggleMute(call: Call) {
+  if (!call.sdk) return;
   call.micMuted = !call.micMuted;
-  if (call.sdk) {
-    if (call.micMuted) call.sdk.session.audioVideo.realtimeMuteLocalAudio();
-    else call.sdk.session.audioVideo.realtimeUnmuteLocalAudio();
-  } else {
-    void post("/api/native/mute", { id: call.id, muted: call.micMuted }).catch(
-      (error) => toast(errorMessage(error), true),
-    );
-  }
+  if (call.micMuted) call.sdk.session.audioVideo.realtimeMuteLocalAudio();
+  else call.sdk.session.audioVideo.realtimeUnmuteLocalAudio();
   renderCalls();
 }
 
@@ -649,7 +666,18 @@ function selectCall(callId: string) {
   renderCalls();
 }
 
+// Redraws wait for the next frame, so a burst of changes draws once.
+let renderQueued = false;
 function renderCalls() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    renderCallsNow();
+  });
+}
+
+function renderCallsNow() {
   renderPills();
   $("#calls-section").hidden = !calls.size && !joining;
   const rows = [...calls.values()].map((call) => {
@@ -681,9 +709,9 @@ function renderCalls() {
           `${call.backend === "native" ? "native" : "SDK"} · ${call.status} · ${present.length} here · ${call.selfAttendeeId}`,
         ),
       ),
-      button(call.micMuted ? "Unmute" : "Mute", () => toggleMute(call)),
       ...(call.sdk
         ? [
+            button(call.micMuted ? "Unmute" : "Mute", () => toggleMute(call)),
             button(
               call.sdk.usingMic ? "Silence" : "Mic",
               () => void toggleMicSource(call),
@@ -1057,6 +1085,7 @@ function reactionFromForm() {
     emojiUrl: String(data.get("emojiUrl")).trim() || undefined,
     repeat: Math.max(1, Math.floor(Number(data.get("repeat")) || 1)),
     interval: Math.max(0, Number(data.get("interval")) || 0),
+    burst: Math.max(1, Math.floor(Number(data.get("burst")) || 1)),
   };
 }
 
@@ -1097,6 +1126,7 @@ async function startServerLoop(
         type: reaction.type,
         emojiUrl: reaction.emojiUrl,
         intervalMs: reaction.interval,
+        burst: reaction.burst,
         count,
       }),
     );
@@ -1113,7 +1143,7 @@ async function startServerLoop(
 function startBrowserLoop(count?: number) {
   let sent = 0;
   const tick = () => {
-    const { emoji, type, emojiUrl, interval } = reactionFromForm();
+    const { emoji, type, emojiUrl, interval, burst } = reactionFromForm();
     const sdk = [...calls.values()].filter(
       (call) =>
         call.backend === "sdk" &&
@@ -1121,9 +1151,10 @@ function startBrowserLoop(count?: number) {
         call.status === "connected",
     );
     if (!sdk.length) return stopBrowserLoop();
-    sendPeerTo(sdk, (fromPeerIdString) =>
-      reacjiMessage({ emoji, type, emojiUrl, fromPeerIdString }),
-    );
+    for (let i = 0; i < burst; i++)
+      sendPeerTo(sdk, (fromPeerIdString) =>
+        reacjiMessage({ emoji, type, emojiUrl, fromPeerIdString }),
+      );
     if (count !== undefined && ++sent >= count) return stopBrowserLoop();
     browserLoop = setTimeout(tick, interval);
   };
@@ -1154,8 +1185,8 @@ function startReactions(count?: number) {
 
 reactionForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  const { emoji, type, emojiUrl, repeat } = reactionFromForm();
-  if (repeat === 1) sendReacji(emoji, type, emojiUrl);
+  const { emoji, type, emojiUrl, repeat, burst } = reactionFromForm();
+  if (repeat === 1 && burst === 1) sendReacji(emoji, type, emojiUrl);
   else startReactions(repeat);
 });
 
@@ -1424,9 +1455,50 @@ $("#topic-add").addEventListener("click", () => {
   renderTopics();
 });
 
-$("#data-clear").addEventListener("click", () =>
-  $("#data-log").replaceChildren(),
-);
+// Log entries are added once a frame, newest first, keeping the latest 500.
+const logLimit = 500;
+const pendingLogItems = new Map<HTMLElement, HTMLElement[]>();
+let logFlushQueued = false;
+function addLogItem(log: HTMLElement, item: HTMLElement) {
+  const pending = pendingLogItems.get(log) ?? [];
+  pending.push(item);
+  // Anything past the limit would be trimmed straight away.
+  if (pending.length > logLimit) pending.shift();
+  pendingLogItems.set(log, pending);
+  if (logFlushQueued) return;
+  logFlushQueued = true;
+  requestAnimationFrame(() => {
+    logFlushQueued = false;
+    for (const [target, items] of pendingLogItems) {
+      target.prepend(...items.reverse());
+      while (target.childElementCount > logLimit)
+        target.lastElementChild?.remove();
+    }
+    pendingLogItems.clear();
+  });
+}
+
+// What the data log shows; it always counts.
+const logMode = $<HTMLSelectElement>("#log-mode");
+const messageCounts = { in: 0, out: 0 };
+let countsQueued = false;
+function countMessage(direction: "in" | "out") {
+  messageCounts[direction]++;
+  if (countsQueued) return;
+  countsQueued = true;
+  requestAnimationFrame(() => {
+    countsQueued = false;
+    $("#log-counts").textContent =
+      `⬇ ${messageCounts.in} ⬆ ${messageCounts.out}`;
+  });
+}
+
+$("#data-clear").addEventListener("click", () => {
+  $("#data-log").replaceChildren();
+  pendingLogItems.delete($("#data-log"));
+  messageCounts.in = messageCounts.out = 0;
+  $("#log-counts").textContent = "";
+});
 
 function logDataMessage(
   call: Call,
@@ -1436,6 +1508,12 @@ function logDataMessage(
     "topic" | "data" | "senderAttendeeId" | "timestampMs"
   > & { senderExternalUserId?: string; throttled?: boolean },
 ) {
+  countMessage(direction);
+  if (
+    logMode.value === "off" ||
+    (logMode.value === "in" && direction === "out")
+  )
+    return;
   const bytes = message.data;
   const decoded = peerTopics.has(message.topic)
     ? decodePeerMessage(bytes)
@@ -1507,9 +1585,7 @@ function logDataMessage(
   if (gif?.type === "Gif" && gif.emoji?.startsWith("https://"))
     item.append(el("img", { className: "preview", src: gif.emoji, alt: "" }));
 
-  const log = $("#data-log");
-  log.prepend(item);
-  while (log.childElementCount > 500) log.lastElementChild?.remove();
+  addLogItem($("#data-log"), item);
 }
 
 // ---------------------------------------------------------------- events
@@ -1556,9 +1632,7 @@ function logEvent(at: number, event: Record<string, unknown>) {
   item.dataset.type = `${type} ${subtype}`;
   item.dataset.huddle = String(huddle);
   item.hidden = !eventVisible(item);
-  const log = $("#event-log");
-  log.prepend(item);
-  while (log.childElementCount > 500) log.lastElementChild?.remove();
+  addLogItem($("#event-log"), item);
 
   if (type === "huddle_invite" && typeof event.call_id === "string") {
     invites.set(event.call_id, event);
@@ -1599,42 +1673,47 @@ apiForm.addEventListener("submit", async (event) => {
 
 function connectServer() {
   const socket = new WebSocket(`ws://${location.host}/ws`);
-  socket.addEventListener("message", (message) => {
-    const data = JSON.parse(String(message.data));
-    if (data.kind === "state") {
-      const { kind: _kind, ...rest } = data;
-      server = rest;
-      renderPills();
-      renderIdentity();
-    } else if (data.kind === "rtm") {
-      logEvent(data.at, data.event);
-    } else if (data.kind === "native") {
-      onNativeEvent(data.id, data.event);
-    } else if (data.kind === "reaction-loop") {
-      onReactionLoop(data.state);
-    } else if (data.kind === "native-left") {
-      const call = calls.get(data.id);
-      if (call) forgetCall(call);
-    } else if (data.kind === "native-calls") {
-      // The server's native huddles outlast the page; adopt them, and drop
-      // any it no longer has.
-      // Running loops follow this snapshot.
-      serverLoops.clear();
-      renderLoopButton();
-      const live = new Set<string>();
-      for (const info of data.calls as NativeCallInfo[]) {
-        live.add(info.id);
-        addNativeCall(info);
-      }
-      for (const call of [...calls.values()])
-        if (call.backend === "native" && !live.has(call.id)) forgetCall(call);
-    }
-  });
+  socket.addEventListener("message", (message) =>
+    handleServerMessage(JSON.parse(String(message.data))),
+  );
   socket.addEventListener("close", () => {
     server = { ...server, realtimeStatus: "page disconnected" };
     renderPills();
     setTimeout(connectServer, 2000);
   });
+}
+
+// The server sends its messages in batches, a few times a second.
+function handleServerMessage(data: any) {
+  if (data.kind === "batch") {
+    for (const each of data.messages) handleServerMessage(each);
+  } else if (data.kind === "state") {
+    const { kind: _kind, ...rest } = data;
+    server = rest;
+    renderPills();
+    renderIdentity();
+  } else if (data.kind === "rtm") {
+    logEvent(data.at, data.event);
+  } else if (data.kind === "native") {
+    onNativeEvent(data.id, data.event);
+  } else if (data.kind === "reaction-loop") {
+    onReactionLoop(data.state);
+  } else if (data.kind === "native-left") {
+    const call = calls.get(data.id);
+    if (call) forgetCall(call);
+  } else if (data.kind === "native-calls") {
+    // The server's native huddles outlast the page; adopt them, and drop
+    // any it no longer has. Running loops follow this snapshot.
+    serverLoops.clear();
+    renderLoopButton();
+    const live = new Set<string>();
+    for (const info of data.calls as NativeCallInfo[]) {
+      live.add(info.id);
+      addNativeCall(info);
+    }
+    for (const call of [...calls.values()])
+      if (call.backend === "native" && !live.has(call.id)) forgetCall(call);
+  }
 }
 
 restoreCredentials();

@@ -2,6 +2,7 @@ import type { ServerWebSocket } from "bun";
 import { NativeCall } from "./src/native/native-call.ts";
 import { ReactionLoop } from "./src/native/reaction-loop.ts";
 import { reactionTypes, type ReactionType } from "./src/peer-message.ts";
+import { RingBuffer } from "./src/ring-buffer.ts";
 import {
   normalizeWorkspaceUrl,
   RealtimeConnection,
@@ -34,20 +35,28 @@ let realtime: RealtimeConnection | undefined;
 let realtimeStatus = "offline";
 const sockets = new Set<ServerWebSocket<unknown>>();
 // Replayed to a page that connects later, so a refresh keeps recent events.
-const recentEvents: UiMessage[] = [];
+const recentEvents = new RingBuffer<UiMessage>(300);
 // Huddles joined natively live here, not in the page, so they outlast it.
 const nativeCalls = new Map<string, NativeCall>();
 let nextNativeId = 1;
 const reactionLoops = new Map<string, ReactionLoop>();
 let nextLoopId = 1;
 
+// Messages to the page go out together every 50 ms, so a flood of reactions
+// or presence changes is a few frames a second rather than one each.
+let outbox: UiMessage[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | undefined;
+
 function broadcast(message: UiMessage) {
-  if (message.kind === "rtm") {
-    recentEvents.push(message);
-    if (recentEvents.length > 300) recentEvents.shift();
-  }
-  const data = JSON.stringify(message);
-  for (const socket of sockets) socket.send(data);
+  if (message.kind === "rtm") recentEvents.push(message);
+  if (!sockets.size) return;
+  outbox.push(message);
+  flushTimer ??= setTimeout(() => {
+    flushTimer = undefined;
+    const data = JSON.stringify({ kind: "batch", messages: outbox });
+    outbox = [];
+    for (const socket of sockets) socket.send(data);
+  }, 50);
 }
 
 function state() {
@@ -97,7 +106,7 @@ function disconnect() {
   slack = undefined;
   identity = undefined;
   realtimeStatus = "offline";
-  recentEvents.length = 0;
+  recentEvents.clear();
   broadcast({ kind: "state", ...state() });
 }
 
@@ -147,6 +156,7 @@ function startReactionLoop(body: Record<string, unknown>) {
           ? body.emojiUrl
           : undefined,
       intervalMs: Math.max(0, Number(body.intervalMs) || 0),
+      burst: Math.max(1, Math.floor(Number(body.burst) || 1)),
       count: count !== undefined && count > 0 ? Math.floor(count) : undefined,
     },
     nativeCalls,
@@ -325,11 +335,13 @@ const server = Bun.serve({
     "/api/native/send": {
       POST: api((body) => {
         const call = requireNative(body);
-        call.send(
-          string(body, "topic"),
-          Buffer.from(String(body.data ?? ""), "base64"),
-          Number(body.lifetimeMs) || 0,
-        );
+        call.send([
+          {
+            topic: string(body, "topic"),
+            data: Buffer.from(String(body.data ?? ""), "base64"),
+            lifetimeMs: Number(body.lifetimeMs) || 0,
+          },
+        ]);
         return { ok: true };
       }),
     },
@@ -339,12 +351,6 @@ const server = Bun.serve({
     "/api/native/reaction-loop/stop": {
       POST: api((body) => {
         reactionLoops.get(string(body, "id"))?.stop();
-        return { ok: true };
-      }),
-    },
-    "/api/native/mute": {
-      POST: api((body) => {
-        requireNative(body).setMuted(Boolean(body.muted));
         return { ok: true };
       }),
     },

@@ -12,6 +12,8 @@ export type ReactionLoopOptions = {
   type?: ReactionType;
   emojiUrl?: string;
   intervalMs: number;
+  /** Reactions per round, sent to each huddle in one signaling frame. */
+  burst?: number;
   /** How many rounds to send; unset runs until stopped. */
   count?: number;
 };
@@ -73,19 +75,23 @@ export class ReactionLoop {
           call !== undefined && call.status === "connected",
       );
     if (!targets.length) return this.stop("no connected huddles left");
+    const burst = Math.max(1, this.options.burst ?? 1);
     for (const call of targets) {
+      // Each huddle's message names its own attendee, so it's encoded once
+      // per huddle and repeated for the burst.
+      const message = {
+        topic: dataChannelTopic,
+        data: encodePeerMessage(
+          reacjiMessage({
+            emoji: this.options.emoji,
+            type: this.options.type,
+            emojiUrl: this.options.emojiUrl,
+            fromPeerIdString: call.attendeeId,
+          }),
+        ),
+      };
       try {
-        call.send(
-          dataChannelTopic,
-          encodePeerMessage(
-            reacjiMessage({
-              emoji: this.options.emoji,
-              type: this.options.type,
-              emojiUrl: this.options.emojiUrl,
-              fromPeerIdString: call.attendeeId,
-            }),
-          ),
-        );
+        call.send(Array.from({ length: burst }, () => message));
       } catch {
         // The huddle dropped between the check and the send; the next round
         // skips it.

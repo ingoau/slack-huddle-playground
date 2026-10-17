@@ -32,15 +32,17 @@ only if you tick "Remember". The server only answers requests whose `Host` and
   The page joins the Amazon Chime meeting itself, muted and sending silence;
   you can unmute or switch to your microphone, and you hear the huddle. Join
   as many huddles as you like at once, or the same huddle any number of
-  times (× count); each is its own Chime connection with its own controls.
+  times (× count, with "at once" joins running in parallel); each is its own
+  Chime connection with its own controls.
 - **Backends**: pick how each join connects.
   - _Chime SDK (this page)_: `amazon-chime-sdk-js` in the browser, with audio
     you can hear and a microphone. Left when the tab closes.
   - _Native (server)_: the server joins Chime itself, without a browser or the
-    SDK, using HuddleFM's native Chime link (protobuf signaling and a
-    relay-only `node-datachannel` peer) sending silence. No audio to hear,
-    but it's light enough for many joins, and native huddles stay joined
-    across page reloads until you leave or disconnect.
+    SDK, as a signaling-only attendee: one WebSocket speaking Chime's
+    protobuf signaling (adapted from HuddleFM), with no WebRTC or audio. It
+    joins, sends and receives reactions and follows presence, and it's light
+    enough for many joins. Native huddles stay joined across page reloads
+    until you leave or disconnect.
 - **Participants**: Chime attendee presence, with Slack names, mute state,
   volume, and a button that sends a `muteRequest`.
 - **Send**: to any mix of joined huddles, ticked at the top of the card.
@@ -48,13 +50,15 @@ only if you tick "Remember". The server only answers requests whose `Host` and
   - Reaction: emoji with any type and `emojiUrl`, repeated any number of
     times at any interval, or looped until you stop it. Native huddles repeat
     on the server, which sends each round itself; SDK huddles repeat on a
-    timer in the page.
+    timer in the page. A burst (×) sends several per round, in one frame
+    for native huddles.
   - Effect: effect reacji such as `gong`.
   - GIF: search Slack's own GIF picker (`gif.search`), or paste any URL.
   - Sticky: the emoji pinned to your tile.
   - Raw: any `PeerMessage` as JSON, or text, hex or base64 bytes on any topic.
 - **Data messages**: everything received or sent on the subscribed topics,
-  decoded where it's a `PeerMessage`, with "Edit & send" to replay it.
+  decoded where it's a `PeerMessage`, with "Edit & send" to replay it. It
+  always counts; set it to received only or nothing to keep floods cheap.
 - **Slack events**: the realtime socket, filtered to huddle events by default.
 - **API console**: call any Web API method as the user.
 

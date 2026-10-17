@@ -91,6 +91,17 @@
                 value="1"
                 class="narrow"
             /></label>
+            <label
+              class="inline"
+              title="How many joins run at the same time; Slack may rate-limit lots"
+              >at once
+              <input
+                name="parallel"
+                type="number"
+                min="1"
+                value="4"
+                class="narrow"
+            /></label>
             <button type="submit" class="primary">Join / start</button>
           </form>
           <h3>Invites</h3>
@@ -167,6 +178,17 @@
                   />
                   ms</label
                 >
+                <label
+                  class="inline"
+                  title="Reactions per round; native huddles get them in one frame"
+                  >×
+                  <input
+                    name="burst"
+                    type="number"
+                    min="1"
+                    value="1"
+                    class="narrow"
+                /></label>
                 <button type="submit" class="primary">Send</button>
                 <button type="button" id="reaction-loop">Start loop</button>
               </div>
@@ -280,6 +302,20 @@
               <button id="topic-add">Add</button>
               <button id="data-clear">Clear</button>
             </div>
+          </div>
+          <div class="row wrap log-controls">
+            <label class="inline"
+              >Log
+              <select
+                id="log-mode"
+                title="What the log shows; it always counts"
+              >
+                <option value="all">Everything</option>
+                <option value="in">Received only</option>
+                <option value="off">Nothing (count only)</option>
+              </select></label
+            >
+            <span class="hint" id="log-counts"></span>
           </div>
           <div class="chips" id="topics"></div>
           <ol class="log" id="data-log"></ol>

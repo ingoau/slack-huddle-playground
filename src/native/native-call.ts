@@ -1,8 +1,9 @@
 import {
-  ChimeLink,
+  SignalLink,
   type ChimeAttendee,
   type ChimeMeeting,
-} from "./chime-link.ts";
+  type DataMessage,
+} from "./signal-link.ts";
 import type { AudioStreamIdInfoFull, SignalFrame } from "./signaling.ts";
 import { statusCodes } from "./status-codes.ts";
 
@@ -21,7 +22,6 @@ export type NativeCallInfo = {
   attendeeId: string;
   meetingId: string;
   status: string;
-  muted: boolean;
   attendees: NativeAttendee[];
 };
 
@@ -44,36 +44,21 @@ function normalizedVolume(attenuation: number) {
   return Math.min(1, Math.max(0, (-attenuation + 42) / 28));
 }
 
-// One 20 ms Opus frame of silence (a CELT-only TOC byte with an empty body).
-const opusSilence = new Uint8Array([0xf8, 0xff, 0xfe]);
-
-// Every native call sends silence on one shared 20 ms clock, so there is a
-// steady audio stream for Chime without a timer per call.
-const silent = new Set<ChimeLink>();
-let silenceTimer: ReturnType<typeof setInterval> | undefined;
-function sendSilence(link: ChimeLink, on: boolean) {
-  if (on) silent.add(link);
-  else silent.delete(link);
-  if (silent.size && !silenceTimer)
-    silenceTimer = setInterval(() => {
-      for (const each of silent) each.sendAudio(opusSilence);
-    }, 20);
-  if (!silent.size && silenceTimer) {
-    clearInterval(silenceTimer);
-    silenceTimer = undefined;
-  }
-}
+/** Volume changes go to the page at most this often per huddle. */
+const volumeReportMs = 500;
 
 /**
  * A huddle joined straight from the server, without a browser or the Chime
- * SDK: HuddleFM's native Chime link, carrying silence and data messages.
+ * SDK: a signaling-only Chime attendee that sends and receives data messages
+ * and follows presence.
  */
 export class NativeCall {
-  private link: ChimeLink;
+  private link: SignalLink;
   private streams = new Map<number, string>();
   private attendees = new Map<string, NativeAttendee>();
+  private volumesChanged = new Set<NativeAttendee>();
+  private volumeTimer?: ReturnType<typeof setTimeout>;
   status = "connecting";
-  muted = true;
 
   constructor(
     readonly id: string,
@@ -86,21 +71,16 @@ export class NativeCall {
   ) {
     const meetingObject = (meeting.Meeting ?? meeting) as ChimeMeeting;
     const attendeeObject = (attendee.Attendee ?? attendee) as ChimeAttendee;
-    this.link = new ChimeLink(meetingObject, attendeeObject, {
+    this.link = new SignalLink(meetingObject, attendeeObject, {
       log: (level, _event, message, fields) =>
         level !== "debug" &&
         log(`${message}${fields ? ` ${JSON.stringify(fields)}` : ""}`),
       onSignaling: () => this.streams.clear(),
       onFrame: (frame) => this.frame(frame),
-      onConnected: () => {
-        sendSilence(this.link, true);
-        this.setStatus("connected");
-      },
+      onConnected: () => this.setStatus("connected"),
       onReconnecting: () => this.setStatus("reconnecting"),
-      onTerminal: (code, reason) => {
-        sendSilence(this.link, false);
-        this.setStatus(`ended (${code}: ${reason})`);
-      },
+      onTerminal: (code, reason) =>
+        this.setStatus(`ended (${code}: ${reason})`),
     });
   }
 
@@ -119,7 +99,6 @@ export class NativeCall {
       attendeeId: this.attendeeId,
       meetingId: String(meeting.MeetingId ?? ""),
       status: this.status,
-      muted: this.muted,
       attendees: [...this.attendees.values()],
     };
   }
@@ -135,18 +114,14 @@ export class NativeCall {
     }
   }
 
-  send(topic: string, data: Uint8Array, lifetimeMs = 0) {
-    if (!this.link.sendData(topic, data, lifetimeMs))
+  /** Sends data messages in one signaling frame. */
+  send(messages: DataMessage[]) {
+    if (!this.link.send(messages))
       throw new Error("This huddle's Chime connection is not open");
   }
 
-  setMuted(muted: boolean) {
-    this.muted = muted;
-    this.link.setMuted(muted);
-  }
-
   async leave() {
-    sendSilence(this.link, false);
+    clearTimeout(this.volumeTimer);
     await this.link.leave();
     this.setStatus(`ended (${statusCodes.left}: left)`);
   }
@@ -170,9 +145,12 @@ export class NativeCall {
       }
       for (const attendee of this.attendees.values()) {
         const volume = levels.get(attendee.attendeeId) ?? 0;
-        if (attendee.present && volume !== attendee.volume)
-          this.update(attendee, { volume });
+        if (attendee.present && volume !== attendee.volume) {
+          attendee.volume = volume;
+          this.volumesChanged.add(attendee);
+        }
       }
+      this.reportVolumes();
     }
     for (const message of frame.data_message?.messages ?? []) {
       if (message.sender_attendee_id === this.attendeeId) continue;
@@ -225,6 +203,19 @@ export class NativeCall {
 
   private update(attendee: NativeAttendee, change: Partial<NativeAttendee>) {
     Object.assign(attendee, change);
+    this.volumesChanged.delete(attendee);
     this.emit({ type: "attendee", attendee: { ...attendee } });
+  }
+
+  // Volumes change many times a second; the page gets the latest ones twice a
+  // second instead of every frame.
+  private reportVolumes() {
+    if (this.volumeTimer || !this.volumesChanged.size) return;
+    this.volumeTimer = setTimeout(() => {
+      this.volumeTimer = undefined;
+      for (const attendee of this.volumesChanged)
+        this.emit({ type: "attendee", attendee: { ...attendee } });
+      this.volumesChanged.clear();
+    }, volumeReportMs);
   }
 }

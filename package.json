@@ -12,6 +12,7 @@
   "dependencies": {
     "@bufbuild/protobuf": "^2",
     "amazon-chime-sdk-js": "3.31.0",
+    "node-datachannel": "0.33.4",
     "protobufjs": "8.8.0"
   },
   "devDependencies": {

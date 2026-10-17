@@ -38,10 +38,10 @@ only if you tick "Remember". The server only answers requests whose `Host` and
   - _Chime SDK (this page)_: `amazon-chime-sdk-js` in the browser, with audio
     you can hear and a microphone. Left when the tab closes.
   - _Native (server)_: the server joins Chime itself, without a browser or the
-    SDK, as a signaling-only attendee: one WebSocket speaking Chime's
-    protobuf signaling (adapted from HuddleFM), with no WebRTC or audio. It
-    joins, sends and receives reactions and follows presence, and it's light
-    enough for many joins. Native huddles stay joined across page reloads
+    SDK, using HuddleFM's native Chime link: protobuf signaling for joining,
+    reactions and presence, and a relay-only `node-datachannel` WebRTC peer
+    sending silence, which Slack needs before it shows the attendee as
+    joined. No audio to hear, but it's light enough for many joins. Native huddles stay joined across page reloads
     until you leave or disconnect.
 - **Participants**: Chime attendee presence, with Slack names, mute state,
   volume, and a button that sends a `muteRequest`.

@@ -1,9 +1,9 @@
 import {
-  SignalLink,
+  ChimeLink,
   type ChimeAttendee,
   type ChimeMeeting,
   type DataMessage,
-} from "./signal-link.ts";
+} from "./chime-link.ts";
 import type { AudioStreamIdInfoFull, SignalFrame } from "./signaling.ts";
 import { statusCodes } from "./status-codes.ts";
 
@@ -47,13 +47,34 @@ function normalizedVolume(attenuation: number) {
 /** Volume changes go to the page at most this often per huddle. */
 const volumeReportMs = 500;
 
+// One 20 ms Opus frame of silence (a CELT-only TOC byte with an empty body).
+const opusSilence = new Uint8Array([0xf8, 0xff, 0xfe]);
+
+// Every native call sends silence on one shared 20 ms clock, so there is a
+// steady audio stream for Chime without a timer per call.
+const silent = new Set<ChimeLink>();
+let silenceTimer: ReturnType<typeof setInterval> | undefined;
+function sendSilence(link: ChimeLink, on: boolean) {
+  if (on) silent.add(link);
+  else silent.delete(link);
+  if (silent.size && !silenceTimer)
+    silenceTimer = setInterval(() => {
+      for (const each of silent) each.sendAudio(opusSilence);
+    }, 20);
+  if (!silent.size && silenceTimer) {
+    clearInterval(silenceTimer);
+    silenceTimer = undefined;
+  }
+}
+
 /**
  * A huddle joined straight from the server, without a browser or the Chime
- * SDK: a signaling-only Chime attendee that sends and receives data messages
- * and follows presence.
+ * SDK: HuddleFM's native Chime link with a WebRTC audio stream of silence,
+ * which Slack needs to show the attendee as joined, carrying data messages
+ * and following presence.
  */
 export class NativeCall {
-  private link: SignalLink;
+  private link: ChimeLink;
   private streams = new Map<number, string>();
   private attendees = new Map<string, NativeAttendee>();
   private volumesChanged = new Set<NativeAttendee>();
@@ -71,16 +92,21 @@ export class NativeCall {
   ) {
     const meetingObject = (meeting.Meeting ?? meeting) as ChimeMeeting;
     const attendeeObject = (attendee.Attendee ?? attendee) as ChimeAttendee;
-    this.link = new SignalLink(meetingObject, attendeeObject, {
+    this.link = new ChimeLink(meetingObject, attendeeObject, {
       log: (level, _event, message, fields) =>
         level !== "debug" &&
         log(`${message}${fields ? ` ${JSON.stringify(fields)}` : ""}`),
       onSignaling: () => this.streams.clear(),
       onFrame: (frame) => this.frame(frame),
-      onConnected: () => this.setStatus("connected"),
+      onConnected: () => {
+        sendSilence(this.link, true);
+        this.setStatus("connected");
+      },
       onReconnecting: () => this.setStatus("reconnecting"),
-      onTerminal: (code, reason) =>
-        this.setStatus(`ended (${code}: ${reason})`),
+      onTerminal: (code, reason) => {
+        sendSilence(this.link, false);
+        this.setStatus(`ended (${code}: ${reason})`);
+      },
     });
   }
 
@@ -122,6 +148,7 @@ export class NativeCall {
 
   async leave() {
     clearTimeout(this.volumeTimer);
+    sendSilence(this.link, false);
     await this.link.leave();
     this.setStatus(`ended (${statusCodes.left}: left)`);
   }

@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Huddle Playground</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Huddle Playground</h1>
+      <div class="pills">
+        <span class="pill" id="slack-pill">Slack: offline</span>
+        <span class="pill" id="rtm-pill">Realtime: offline</span>
+        <span class="pill" id="call-pill">Huddle: not joined</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="column">
+        <article class="card" id="connect-card">
+          <h2>Connect</h2>
+          <form id="connect-form" autocomplete="off">
+            <label
+              >Workspace
+              <input
+                name="workspaceUrl"
+                placeholder="acme.slack.com"
+                required
+              />
+            </label>
+            <label
+              >xoxc token
+              <input
+                name="xoxc"
+                type="password"
+                placeholder="xoxc-…"
+                required
+              />
+            </label>
+            <label
+              ><span>xoxd cookie (<code>d</code>)</span>
+              <input
+                name="xoxd"
+                type="password"
+                placeholder="xoxd-…"
+                required
+              />
+            </label>
+            <label class="inline"
+              ><input type="checkbox" name="remember" /> Remember in this
+              browser</label
+            >
+            <div class="row">
+              <button type="submit" class="primary">Connect</button>
+              <button type="button" id="disconnect">Disconnect</button>
+            </div>
+          </form>
+          <p class="identity" id="identity"></p>
+        </article>
+
+        <article class="card">
+          <h2>Huddle</h2>
+          <form id="join-form" class="row wrap">
+            <input
+              name="channelId"
+              placeholder="Channel or DM ID (C…, D…, G…)"
+              required
+            />
+            <select name="region" title="Media region">
+              <option>us-east-1</option>
+              <option>us-west-2</option>
+              <option>eu-central-1</option>
+              <option>eu-west-2</option>
+              <option>ap-southeast-2</option>
+              <option>ap-northeast-1</option>
+            </select>
+            <button type="submit" class="primary">Join / start</button>
+          </form>
+          <h3>Invites</h3>
+          <ul class="list" id="invites">
+            <li class="empty">
+              Invites to huddles arrive here over the realtime socket.
+            </li>
+          </ul>
+          <div id="call" hidden>
+            <h3>Current call</h3>
+            <dl class="facts" id="call-facts"></dl>
+            <div class="row wrap">
+              <button id="mic-toggle">Unmute</button>
+              <button id="mic-source">Use microphone</button>
+              <button id="speaker-toggle">Mute speaker</button>
+              <button id="leave" class="danger">Leave</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2>Participants</h2>
+          <ul class="list" id="roster">
+            <li class="empty">Join a huddle to see who is in it.</li>
+          </ul>
+        </article>
+      </section>
+
+      <section class="column">
+        <article class="card">
+          <h2>Send</h2>
+          <nav class="tabs" id="send-tabs">
+            <button data-tab="reaction" class="active">Reaction</button>
+            <button data-tab="effect">Effect</button>
+            <button data-tab="gif">GIF</button>
+            <button data-tab="sticky">Sticky</button>
+            <button data-tab="raw">Raw</button>
+          </nav>
+
+          <div class="tab" data-panel="reaction">
+            <div class="chips" id="emoji-chips"></div>
+            <form id="reaction-form" class="stack">
+              <div class="row">
+                <input name="emoji" placeholder=":tada:" required />
+                <select name="type">
+                  <option>Standard</option>
+                  <option>Effect</option>
+                  <option>Gif</option>
+                </select>
+              </div>
+              <input
+                name="emojiUrl"
+                placeholder="emojiUrl (optional, for custom emoji)"
+              />
+              <div class="row">
+                <label class="inline"
+                  >Repeat
+                  <input
+                    name="repeat"
+                    type="number"
+                    min="1"
+                    max="100"
+                    value="1"
+                    class="narrow"
+                /></label>
+                <label class="inline"
+                  >every
+                  <input
+                    name="interval"
+                    type="number"
+                    min="20"
+                    value="150"
+                    class="narrow"
+                  />
+                  ms</label
+                >
+                <button type="submit" class="primary">Send</button>
+              </div>
+            </form>
+            <p class="hint">
+              Several people sending the same emoji in quick succession sets off
+              Slack's "explosion"; repeat lets one client try it.
+            </p>
+          </div>
+
+          <div class="tab" data-panel="effect" hidden>
+            <div class="chips" id="effect-chips"></div>
+            <form id="effect-form" class="row">
+              <input
+                name="emoji"
+                placeholder="effect name, e.g. gong"
+                required
+              />
+              <button type="submit" class="primary">Send effect</button>
+            </form>
+            <p class="hint">
+              Effects are reacji with type Effect. These names come from the
+              picker in Slack's client; which ones animate depends on Slack's
+              feature flags.
+            </p>
+          </div>
+
+          <div class="tab" data-panel="gif" hidden>
+            <form id="gif-search" class="row">
+              <input name="query" placeholder="Search Slack's GIF picker" />
+              <button type="submit">Search</button>
+            </form>
+            <div class="gif-grid" id="gif-results"></div>
+            <form id="gif-form" class="row">
+              <input
+                name="url"
+                placeholder="https://media.tenor.com/….gif"
+                required
+              />
+              <button type="submit" class="primary">Send GIF</button>
+            </form>
+            <p class="hint">
+              A GIF reaction puts the image URL in <code>emoji</code> with type
+              Gif. Receivers load it directly, without Slack's image proxy.
+            </p>
+          </div>
+
+          <div class="tab" data-panel="sticky" hidden>
+            <div class="chips" id="sticky-chips"></div>
+            <form id="sticky-form" class="stack">
+              <input name="emoji" placeholder="speaker" />
+              <div class="row">
+                <input name="channel" placeholder="Awareness channel" />
+                <input name="user" placeholder="User ID" />
+              </div>
+              <div class="row">
+                <button type="submit" class="primary">Set sticky</button>
+                <button type="button" id="sticky-clear">Clear</button>
+              </div>
+            </form>
+            <p class="hint">
+              Sticky emoji travel as an <code>awarenessBroadcast</code> with
+              field <code>stickyEmoji</code>. The channel is prefilled with the
+              huddle's channel, which is a guess; edit it if Slack ignores it.
+            </p>
+          </div>
+
+          <div class="tab" data-panel="raw" hidden>
+            <form id="raw-form" class="stack">
+              <div class="row">
+                <input name="topic" value="data-channel" required />
+                <select name="encoding">
+                  <option value="peer">PeerMessage JSON</option>
+                  <option value="text">UTF-8 text</option>
+                  <option value="hex">Hex bytes</option>
+                  <option value="base64">Base64 bytes</option>
+                </select>
+                <label
+                  class="inline"
+                  title="How long Chime keeps the message for attendees who join later (0 = not kept)"
+                  >TTL
+                  <input
+                    name="lifetime"
+                    type="number"
+                    min="0"
+                    value="0"
+                    class="narrow"
+                  />
+                  ms</label
+                >
+              </div>
+              <div class="chips" id="raw-templates"></div>
+              <textarea name="payload" rows="10" spellcheck="false"></textarea>
+              <div class="row">
+                <button type="submit" class="primary">Send</button>
+                <span class="hint" id="raw-size"></span>
+              </div>
+            </form>
+          </div>
+        </article>
+
+        <article class="card grow">
+          <div class="card-head">
+            <h2>Data messages</h2>
+            <div class="row">
+              <input id="topic-input" placeholder="Subscribe to topic" />
+              <button id="topic-add">Add</button>
+              <button id="data-clear">Clear</button>
+            </div>
+          </div>
+          <div class="chips" id="topics"></div>
+          <ol class="log" id="data-log"></ol>
+        </article>
+      </section>
+
+      <section class="column">
+        <article class="card grow">
+          <div class="card-head">
+            <h2>Slack events</h2>
+            <div class="row">
+              <input id="event-filter" placeholder="Filter by type" />
+              <label class="inline"
+                ><input type="checkbox" id="event-huddle-only" checked /> Huddle
+                only</label
+              >
+              <button id="event-clear">Clear</button>
+            </div>
+          </div>
+          <ol class="log" id="event-log"></ol>
+        </article>
+
+        <article class="card">
+          <h2>API console</h2>
+          <form id="api-form" class="stack">
+            <input
+              name="method"
+              placeholder="screenhero.rooms.info"
+              list="api-methods"
+              required
+            />
+            <datalist id="api-methods">
+              <option>auth.test</option>
+              <option>screenhero.rooms.info</option>
+              <option>rooms.join</option>
+              <option>rooms.leave</option>
+              <option>huddles.get</option>
+              <option>huddles.history</option>
+              <option>gif.search</option>
+              <option>gif.featured</option>
+              <option>conversations.info</option>
+              <option>users.info</option>
+            </datalist>
+            <textarea
+              name="fields"
+              rows="4"
+              spellcheck="false"
+              placeholder='{"room": "R…"}'
+            ></textarea>
+            <button type="submit" class="primary">Call</button>
+          </form>
+          <pre class="output" id="api-output"></pre>
+        </article>
+      </section>
+    </main>
+
+    <audio id="huddle-audio" autoplay></audio>
+    <div class="toast" id="toast" hidden></div>
+    <script type="module" src="/client.js"></script>
+  </body>
+</html>
